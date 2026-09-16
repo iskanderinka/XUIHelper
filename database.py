@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -37,21 +38,34 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_tr_date  ON traffic_records(record_date);
         CREATE INDEX IF NOT EXISTS idx_tr_panel ON traffic_records(panel_name);
         CREATE INDEX IF NOT EXISTS idx_tr_email ON traffic_records(email);
-        CREATE TABLE IF NOT EXISTS query_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            source      TEXT    NOT NULL,
-            actor       TEXT    NOT NULL,
-            panel_name  TEXT    NOT NULL,
-            email       TEXT    NOT NULL,
-            success     INTEGER DEFAULT 0,
-            created_at  TEXT    DEFAULT (datetime('now','localtime'))
+
+        CREATE TABLE IF NOT EXISTS bot_users (
+            tg_id        INTEGER PRIMARY KEY,
+            username     TEXT,
+            first_name   TEXT,
+            first_seen   TEXT    DEFAULT (datetime('now','localtime'))
         );
-        CREATE INDEX IF NOT EXISTS idx_ql_created ON query_logs(created_at);
+
+        CREATE TABLE IF NOT EXISTS client_bindings (
+            tg_id        INTEGER NOT NULL,
+            panel_name   TEXT    NOT NULL,
+            email        TEXT    NOT NULL,
+            inbound_ids  TEXT    NOT NULL,
+            sub_id       TEXT    NOT NULL,
+            uuid         TEXT    NOT NULL,
+            limit_hwid   INTEGER DEFAULT 0,
+            created_at   TEXT    DEFAULT (datetime('now','localtime')),
+            PRIMARY KEY (tg_id, panel_name, email)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cb_tg    ON client_bindings(tg_id);
+        CREATE INDEX IF NOT EXISTS idx_cb_email ON client_bindings(panel_name, email);
     """)
     conn.commit()
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
 
+
+# ---------- Снимки трафика ----------
 
 def batch_record_traffic(records: List[Tuple]):
     """Each tuple: (panel_name, email, upload, download, total_bytes, expiry_time, record_date)"""
@@ -59,7 +73,7 @@ def batch_record_traffic(records: List[Tuple]):
         return
     conn = _get_conn()
     conn.executemany(
-       """INSERT INTO traffic_records
+        """INSERT INTO traffic_records
                (panel_name, email, upload, download, total_bytes, expiry_time, record_date)
           VALUES (?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(panel_name, email, record_date)
@@ -74,7 +88,7 @@ def batch_record_traffic(records: List[Tuple]):
 
 def cleanup_old_traffic(retention_days: int = 365,
                         reference_date: Optional[str] = None) -> int:
-    """Delete snapshots outside the inclusive retention window."""
+    """Удаляет снимки трафика за пределами окна хранения."""
     retention_days = max(1, int(retention_days))
     if reference_date:
         reference = datetime.strptime(reference_date, "%Y-%m-%d").date()
@@ -91,12 +105,12 @@ def cleanup_old_traffic(retention_days: int = 365,
     conn.commit()
     conn.close()
     if deleted:
-        logger.info("Removed %s traffic records older than %s.", deleted, cutoff)
+        logger.info("Удалено %s записей трафика старше %s.", deleted, cutoff)
     return deleted
 
 
 def _delta_cte() -> str:
-    """Reusable CTE: computes per-row daily deltas from consecutive cumulative snapshots."""
+    """CTE: вычисляет посуточные дельты из кумулятивных снимков."""
     return """
     WITH deltas AS (
         SELECT
@@ -263,7 +277,7 @@ def get_date_range() -> Optional[Tuple[str, str]]:
 
 
 def has_daily_traffic_snapshot(record_date: str) -> bool:
-    """Return whether a date has the scheduled end-of-day traffic snapshot."""
+    """Проверяет, есть ли за дату снимок, сделанный по расписанию (после 23:00)."""
     conn = _get_conn()
     row = conn.execute(
         """SELECT 1 FROM traffic_records
@@ -273,32 +287,6 @@ def has_daily_traffic_snapshot(record_date: str) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
-
-
-def record_query_log(source: str, actor: str, panel_name: str, email: str, success: bool) -> None:
-    """Persist a single query log entry (TG bot or Web)."""
-    conn = _get_conn()
-    conn.execute(
-        """INSERT INTO query_logs (source, actor, panel_name, email, success)
-           VALUES (?, ?, ?, ?, ?)""",
-        (source, str(actor), panel_name or "", email or "", 1 if success else 0),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_query_logs(limit: int = 200) -> List[Dict]:
-    """Return recent query log entries newest-first."""
-    conn = _get_conn()
-    rows = conn.execute(
-        """SELECT id, source, actor, panel_name, email, success, created_at
-           FROM query_logs
-           ORDER BY id DESC
-           LIMIT ?""",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 
 def get_panel_user_list(panel_name: str) -> List[str]:
@@ -321,3 +309,134 @@ def get_panel_summary_for_date(panel_name: str, record_date: str) -> List[Dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ---------- bot_users: кто запускал бота ----------
+
+def upsert_bot_user(tg_id: int, username: str = "", first_name: str = "") -> None:
+    """Записывает или обновляет информацию о пользователе, запустившем бота."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO bot_users (tg_id, username, first_name)
+           VALUES (?, ?, ?)
+           ON CONFLICT(tg_id) DO UPDATE SET
+               username   = excluded.username,
+               first_name = excluded.first_name""",
+        (int(tg_id), username or "", first_name or ""),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_bot_user(tg_id: int) -> bool:
+    """Проверяет, запускал ли пользователь бота."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM bot_users WHERE tg_id = ? LIMIT 1", (int(tg_id),)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_bot_user(tg_id: int) -> Optional[Dict]:
+    """Возвращает запись о пользователе бота."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM bot_users WHERE tg_id = ?", (int(tg_id),)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_bot_users() -> List[Dict]:
+    """Список всех, кто когда-либо запускал бота."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bot_users ORDER BY first_seen DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------- client_bindings: связки клиентов ----------
+
+def save_binding(
+    tg_id: int,
+    panel_name: str,
+    email: str,
+    inbound_ids: list,
+    sub_id: str,
+    uuid: str,
+    limit_hwid: int = 0,
+) -> None:
+    """Сохраняет или обновляет связку клиента."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO client_bindings
+               (tg_id, panel_name, email, inbound_ids, sub_id, uuid, limit_hwid)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(tg_id, panel_name, email) DO UPDATE SET
+               inbound_ids = excluded.inbound_ids,
+               sub_id      = excluded.sub_id,
+               uuid        = excluded.uuid,
+               limit_hwid  = excluded.limit_hwid""",
+        (int(tg_id), panel_name, email, json.dumps(inbound_ids),
+         sub_id, uuid, int(limit_hwid)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _parse_binding_row(row) -> Dict:
+    """Преобразует строку из БД в словарь с распарсенным inbound_ids."""
+    d = dict(row)
+    try:
+        d["inbound_ids"] = json.loads(d["inbound_ids"])
+    except (ValueError, TypeError):
+        d["inbound_ids"] = []
+    return d
+
+
+def get_user_bindings(tg_id: int) -> List[Dict]:
+    """Возвращает все связки пользователя."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM client_bindings WHERE tg_id = ? ORDER BY panel_name, email",
+        (int(tg_id),),
+    ).fetchall()
+    conn.close()
+    return [_parse_binding_row(r) for r in rows]
+
+
+def get_binding_by_email(panel_name: str, email: str) -> Optional[Dict]:
+    """Находит связку по панели и email (для проверки занятости)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM client_bindings WHERE panel_name = ? AND email = ?",
+        (panel_name, email),
+    ).fetchone()
+    conn.close()
+    return _parse_binding_row(row) if row else None
+
+
+def delete_binding(tg_id: int, panel_name: str, email: str) -> bool:
+    """Удаляет конкретную связку. Возвращает True, если что-то удалили."""
+    conn = _get_conn()
+    cursor = conn.execute(
+        "DELETE FROM client_bindings WHERE tg_id = ? AND panel_name = ? AND email = ?",
+        (int(tg_id), panel_name, email),
+    )
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def list_all_bindings() -> List[Dict]:
+    """Возвращает все связки (для админских команд)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM client_bindings ORDER BY panel_name, email"
+    ).fetchall()
+    conn.close()
+    return [_parse_binding_row(r) for r in rows]

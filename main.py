@@ -1,6 +1,8 @@
 import logging
-import subprocess
-import sys
+import uuid as uuid_module
+import secrets
+import string
+import json
 from functools import wraps
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
@@ -15,16 +17,24 @@ from telegram.ext import (
 )
 
 import config
+import database
 from xui_api import XUIApi
+from query_logic import query_user_data
 from database import (
     init_db, batch_record_traffic, cleanup_old_traffic,
     get_daily_stats, get_panel_daily_stats, get_top_users, has_daily_traffic_snapshot,
-    record_query_log,
+    upsert_bot_user, is_bot_user,
+    save_binding, get_user_bindings, get_binding_by_email,
+    delete_binding, list_all_bindings,
 )
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# Эти библиотеки слишком болтливы — INFO у них на каждый HTTP-запрос
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("xui_api").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 SCHEDULE_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
@@ -35,10 +45,16 @@ def _scheduled_time(hour: int, minute: int = 0) -> time:
     return time(hour=hour, minute=minute, tzinfo=SCHEDULE_TIMEZONE)
 
 
+def _make_sub_id(length: int = 16) -> str:
+    """Генерирует subId: строчные буквы и цифры."""
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
 # Инициализируем БД при старте
 init_db()
 
-# --- Ограничение частоты запросов ---
+# --- Ограничение частоты запросов (для /mystatus) ---
 failed_query_attempts = {}
 blocked_users = {}
 
@@ -58,6 +74,17 @@ def _format_bytes(size: int) -> str:
 
 def _bytes_to_gb(size: int) -> float:
     return round(size / (1024 ** 3), 2)
+
+
+def _get_panel_api(panel_name: str) -> XUIApi:
+    """Создаёт клиент XUIApi по имени панели."""
+    panel_config = config.get_panel_config(panel_name)
+    return XUIApi(
+        url=panel_config.get("url", ""),
+        username=panel_config.get("username", ""),
+        password=panel_config.get("password", ""),
+        sub_url=panel_config.get("sub_url", ""),
+    )
 
 
 # --- Декораторы ---
@@ -81,13 +108,20 @@ def admin_only(func):
     return wrapper
 
 
-# --- Обработчики бота ---
-@authorized
+# --- Базовые команды ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    # Регистрируем пользователя в bot_users
+    try:
+        upsert_bot_user(user.id, user.username or "", user.first_name or "")
+    except Exception as e:
+        logger.error(f"Не удалось записать bot_user {user.id}: {e}")
+
     await update.message.reply_html(
         rf"Привет, {user.mention_html()}! "
-        f"Добро пожаловать в бот управления панелями 3x-ui. Используйте /help для списка команд.",
+        f"Твой Telegram ID: <code>{user.id}</code>\n\n"
+        f"Если ты клиент — админ выдаст тебе подписку, и она придёт в этот чат автоматически.\n"
+        f"Используй /help для списка команд.",
     )
 
 
@@ -99,7 +133,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/start - 🚀 Начать работу с ботом\n"
             "/help - ℹ️ Показать эту справку\n"
             "/setting - ⚙️ Добавить или обновить панель\n"
-            "/delpanel <имя> - 🗑️ Удалить панель по имени\n"
+            "/inbounds <панель> - 📡 Список инбаундов с ID\n"
+            "/addclient <tg_id> <email> <панель> <id1> [id2] ... - 🆕 Создать клиента\n"
+            "/revoke <tg_id> [email] - 🗑️ Удалить клиента\n"
+            "/listclients - 📋 Список выданных клиентов\n"
+            "/delpanel <имя> - 🗑️ Удалить панель\n"
             "/listpanels - 📋 Список всех панелей\n"
             "/status <имя> - 📊 Статус панели (без имени — все)\n"
             "/adduser <ID> - ✅ Добавить обычного пользователя\n"
@@ -114,11 +152,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "**👋 Команды пользователя:**\n"
             "/start - 🚀 Начать работу с ботом\n"
             "/help - ℹ️ Показать эту справку\n"
-            "/query <панель> <имя> - 🔍 Информация о ноде"
+            "/mylink - 🔗 Получить ссылку подписки\n"
+            "/mystatus - 📊 Мой трафик и срок действия"
         )
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 
+# --- Админские команды по панелям ---
 @admin_only
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     panel_name = context.args[0] if context.args else None
@@ -134,7 +174,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if panel_config.get("disabled", False):
                 status_messages.append(f"- **{name}**: `отключена`")
                 continue
-            async with XUIApi(panel_config["url"], panel_config["username"], panel_config["password"]) as api:
+            async with _get_panel_api(name) as api:
                 status = await api.get_server_status()
             if status and 'xray' in status:
                 xray_status = status['xray'].get('state', 'N/A')
@@ -152,7 +192,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text(f"Получаю статус сервера '{panel_name}', подождите...")
 
-    async with XUIApi(panel_config["url"], panel_config["username"], panel_config["password"]) as api:
+    async with _get_panel_api(panel_name) as api:
         status = await api.get_server_status()
     if status and 'cpu' in status and 'mem' in status and 'disk' in status:
         cpu_percent = status.get('cpu', 0)
@@ -199,80 +239,123 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"Не удалось получить полный статус '{panel_name}'. Проверьте подключение или повторите позже.")
 
 
-from query_logic import query_user_data
-
-
-@authorized
-async def query_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-
-    if user_id in blocked_users:
-        unblock_time = blocked_users[user_id]
-        if datetime.now() < unblock_time:
-            remaining_time = unblock_time - datetime.now()
-            await update.message.reply_text(
-                f"Слишком частые запросы. Временная блокировка. Повторите через {int(remaining_time.total_seconds() / 60)} мин.")
-            return
-        else:
-            del blocked_users[user_id]
-            if user_id in failed_query_attempts:
-                del failed_query_attempts[user_id]
-
-    if len(context.args) < 2:
-        await update.message.reply_text("Укажите имя панели и имя пользователя. Формат: /query <панель> <имя>")
+@admin_only
+async def inbounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает список инбаундов панели с их ID (чтобы админ знал, что вводить)."""
+    if not context.args:
+        await update.message.reply_text("Формат: /inbounds <имя панели>")
+        return
+    panel_name = context.args[0]
+    if not config.get_panel_config(panel_name):
+        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
         return
 
-    panel_name, query_user = context.args[0], context.args[1]
-    await update.message.reply_text(f"Ищу на '{panel_name}', подождите...")
+    await update.message.reply_text(f"Загружаю инбаунды панели '{panel_name}'...")
 
-    success, result = await query_user_data(panel_name, query_user)
-    try:
-        record_query_log("telegram", update.effective_user.id, panel_name, query_user, success)
-    except Exception:
-        pass
+    async with _get_panel_api(panel_name) as api:
+        ok = await api.login()
+        if not ok:
+            await update.message.reply_text("❌ Не удалось подключиться к панели.")
+            return
+        inbounds = await api.get_inbounds_list()
 
-    if success:
-        if user_id in failed_query_attempts:
-            del failed_query_attempts[user_id]
-        accounting_mode = config.get_accounting_mode()
-        used_gb = result['used_gb']
-        total_gb = result['total_gb']
-        if accounting_mode == "bidirectional":
-            try:
-                used_gb = float(used_gb) * 2
-                total_gb = float(total_gb) * 2
-            except (ValueError, TypeError):
-                pass
-        try:
-            used_gb_formatted = f"{float(used_gb):.2f}"
-            total_gb_formatted = f"{float(total_gb):.2f}"
-        except (ValueError, TypeError):
-            used_gb_formatted = used_gb
-            total_gb_formatted = total_gb
+    if not inbounds:
+        await update.message.reply_text("Инбаунды не найдены.")
+        return
 
-        reply_text = (
-            f"**Информация о ноде пользователя {result['email']} на панели '{result['panel_name']}':**\n"
-            f"- Трафик: {used_gb_formatted} GB / {total_gb_formatted} GB\n"
-            f"- Срок действия: {result['expiry_date']}"
+    lines = [f"**Инбаунды панели '{panel_name}':**\n"]
+    for ib in inbounds:
+        status = "✅" if ib.get("enable") else "⛔"
+        lines.append(
+            f"{status} ID `{ib['id']}` — {ib.get('remark', 'без имени')} "
+            f"({ib.get('protocol', '?')}:{ib.get('port', '?')})"
         )
-        await update.message.reply_text(reply_text, parse_mode='Markdown')
+    lines.append("\nИспользуй ID в команде `/addclient`.")
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+@admin_only
+async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    all_panels = config.get_all_panels()
+    if not all_panels:
+        await update.message.reply_text("Панели не настроены.")
+        return
+    message = "**Список настроенных панелей:**\n\n"
+    for name, pconf in all_panels.items():
+        reset_day = pconf.get("reset_day", "1 (по умолчанию)")
+        disabled_tag = " ⛔отключена" if pconf.get("disabled", False) else ""
+        message += f"- **{name}**{disabled_tag}: `{pconf['url']}`\n  День сброса: {reset_day}-е число\n"
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+
+@admin_only
+async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Формат: /delpanel <имя панели>")
+        return
+    panel_name = context.args[0]
+    if config.delete_panel(panel_name):
+        await update.message.reply_text(f"🗑️ Панель '{panel_name}' успешно удалена.")
     else:
-        await update.message.reply_text(result)
-        now = datetime.now()
-        if user_id not in failed_query_attempts:
-            failed_query_attempts[user_id] = []
-        failed_query_attempts[user_id].append(now)
-        five_minutes_ago = now - timedelta(minutes=5)
-        failed_query_attempts[user_id] = [
-            t for t in failed_query_attempts[user_id] if t > five_minutes_ago
-        ]
-        if len(failed_query_attempts[user_id]) >= 5:
-            block_duration = timedelta(hours=2)
-            blocked_users[user_id] = now + block_duration
-            await update.message.reply_text("Слишком частые запросы несуществующих пользователей. Блокировка на 2 часа.")
-            del failed_query_attempts[user_id]
+        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
 
 
+@admin_only
+async def setresetday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Формат: /setresetday <имя панели> <день (1-28)>")
+        return
+    panel_name = context.args[0]
+    try:
+        day = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("День должен быть целым числом от 1 до 28.")
+        return
+    if day < 1 or day > 28:
+        await update.message.reply_text("День должен быть в диапазоне 1–28.")
+        return
+    panel_config = config.get_panel_config(panel_name)
+    if not panel_config:
+        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
+        return
+    config.add_or_update_panel(
+        panel_name, panel_config["url"], panel_config["username"],
+        panel_config["password"], reset_day=day,
+        sub_url=panel_config.get("sub_url", ""),
+    )
+    await update.message.reply_text(f"✅ День сброса трафика панели '{panel_name}' установлен на {day}-е число.")
+
+
+@admin_only
+async def resetpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Формат: /resetpanel <имя панели>")
+        return
+    panel_name = context.args[0]
+    if not config.get_panel_config(panel_name):
+        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
+        return
+    await update.message.reply_text(f"Сбрасываю трафик панели '{panel_name}'...")
+    initiator = update.effective_user
+    init_name = initiator.full_name or initiator.username or str(initiator.id)
+    async with _get_panel_api(panel_name) as api:
+        success = await api.reset_all_client_traffic()
+    if success:
+        await update.message.reply_text(f"✅ Трафик панели '{panel_name}' успешно сброшен!")
+        msg = f"✅ **{panel_name}**: трафик сброшен! (вручную, инициатор: {init_name})"
+    else:
+        await update.message.reply_text(f"❌ Не удалось сбросить трафик панели '{panel_name}'!")
+        msg = f"❌ **{panel_name}**: не удалось сбросить трафик! (вручную, инициатор: {init_name})"
+    for uid in config.get_admin_users():
+        if uid == update.effective_user.id:
+            continue
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Не удалось уведомить администратора {uid}: {e}")
+
+
+# --- Управление пользователями бота ---
 @admin_only
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
@@ -313,92 +396,326 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(message, parse_mode='Markdown')
 
 
-@admin_only
-async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Формат: /delpanel <имя панели>")
-        return
-    panel_name = context.args[0]
-    if config.delete_panel(panel_name):
-        await update.message.reply_text(f"🗑️ Панель '{panel_name}' успешно удалена.")
-    else:
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
+# --- /addclient ---
+AC_HWID = 1  # состояние ConversationHandler
 
 
 @admin_only
-async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    all_panels = config.get_all_panels()
-    if not all_panels:
-        await update.message.reply_text("Панели не настроены.")
-        return
-    message = "**Список настроенных панелей:**\n\n"
-    for name, pconf in all_panels.items():
-        reset_day = pconf.get("reset_day", "1 (по умолчанию)")
-        disabled_tag = " ⛔отключена" if pconf.get("disabled", False) else ""
-        message += f"- **{name}**{disabled_tag}: `{pconf['url']}`\n  День сброса: {reset_day}-е число\n"
-    await update.message.reply_text(message, parse_mode='Markdown')
+async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    args = context.args
+    if len(args) < 4:
+        await update.message.reply_text(
+            "Формат: /addclient <tg_id> <email> <панель> <inbound_id1> [inbound_id2] ...\n"
+            "Пример: /addclient 123456789 user123 TMT 8 9"
+        )
+        return ConversationHandler.END
 
-
-@admin_only
-async def setresetday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Устанавливает день сброса трафика для конкретной панели."""
-    if len(context.args) < 2:
-        await update.message.reply_text("Формат: /setresetday <имя панели> <день (1-28)>")
-        return
-    panel_name = context.args[0]
+    # Парсим TG ID
     try:
-        day = int(context.args[1])
+        tg_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("День должен быть целым числом от 1 до 28.")
-        return
-    if day < 1 or day > 28:
-        await update.message.reply_text("День должен быть в диапазоне 1–28.")
-        return
+        await update.message.reply_text("TG ID должен быть числом.")
+        return ConversationHandler.END
+
+    email = args[1].strip()
+    panel_name = args[2].strip()
+
+    # Парсим ID инбаундов
+    try:
+        inbound_ids = [int(x) for x in args[3:]]
+    except ValueError:
+        await update.message.reply_text("ID инбаундов должны быть числами.")
+        return ConversationHandler.END
+
+    # Проверки
+    if not is_bot_user(tg_id):
+        await update.message.reply_text(
+            f"❌ Пользователь {tg_id} не запускал бота.\n"
+            f"Попроси его нажать /start."
+        )
+        return ConversationHandler.END
+
     panel_config = config.get_panel_config(panel_name)
     if not panel_config:
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
-        return
-    config.add_or_update_panel(
-        panel_name, panel_config["url"], panel_config["username"],
-        panel_config["password"], reset_day=day
+        await update.message.reply_text(f"❌ Панель '{panel_name}' не найдена.")
+        return ConversationHandler.END
+
+    if get_binding_by_email(panel_name, email):
+        await update.message.reply_text(
+            f"❌ Клиент с email '{email}' уже существует в базе на панели '{panel_name}'."
+        )
+        return ConversationHandler.END
+
+    # Проверка, что инбаунды существуют (через API)
+    async with _get_panel_api(panel_name) as api:
+        ok = await api.login()
+        if not ok:
+            await update.message.reply_text("❌ Не удалось подключиться к панели.")
+            return ConversationHandler.END
+        available = await api.get_inbounds_list()
+
+    available_ids = {ib["id"] for ib in available}
+    missing = [i for i in inbound_ids if i not in available_ids]
+    if missing:
+        await update.message.reply_text(
+            f"❌ Инбаунды {missing} не найдены на панели '{panel_name}'.\n"
+            f"Доступные ID: {sorted(available_ids)}\n"
+            f"Посмотреть список: /inbounds {panel_name}"
+        )
+        return ConversationHandler.END
+
+    # Сохраняем промежуточные данные
+    context.user_data['ac'] = {
+        "tg_id": tg_id,
+        "email": email,
+        "panel_name": panel_name,
+        "inbound_ids": inbound_ids,
+    }
+
+    await update.message.reply_text(
+        f"Создаю клиента:\n"
+        f"- TG ID: `{tg_id}`\n"
+        f"- Email: `{email}`\n"
+        f"- Панель: `{panel_name}`\n"
+        f"- Инбаунды: `{inbound_ids}`\n\n"
+        f"Введи лимит HWID (целое число >= 0), или `/skip` для безлимита:",
+        parse_mode='Markdown',
     )
-    await update.message.reply_text(f"✅ День сброса трафика панели '{panel_name}' установлен на {day}-е число.")
+    return AC_HWID
+
+
+async def addclient_hwid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text.lower() in ("/skip", "skip", "пропустить"):
+        hwid = 0
+    else:
+        try:
+            hwid = int(text)
+            if hwid < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Нужно целое число >= 0, или /skip.")
+            return AC_HWID
+
+    data = context.user_data.pop("ac", None)
+    if not data:
+        await update.message.reply_text("Сессия потеряна. Начни заново.")
+        return ConversationHandler.END
+
+    panel_name = data["panel_name"]
+    tg_id = data["tg_id"]
+    email = data["email"]
+    inbound_ids = data["inbound_ids"]
+
+    client_uuid = str(uuid_module.uuid4())
+    sub_id = _make_sub_id()
+
+    async with _get_panel_api(panel_name) as api:
+        ok = await api.login()
+        if not ok:
+            await update.message.reply_text("❌ Не удалось подключиться к панели.")
+            return ConversationHandler.END
+
+        created = await api.create_client(
+            email=email,
+            client_uuid=client_uuid,
+            sub_id=sub_id,
+            inbound_ids=inbound_ids,
+            limit_hwid=hwid,
+            tg_id=tg_id,
+        )
+        sub_link = api.get_client_sub_link(sub_id)
+
+    if not created:
+        await update.message.reply_text("❌ Не удалось создать клиента. Проверь логи бота.")
+        return ConversationHandler.END
+
+    # Сохраняем в БД
+    try:
+        save_binding(
+            tg_id=tg_id,
+            panel_name=panel_name,
+            email=email,
+            inbound_ids=inbound_ids,
+            sub_id=sub_id,
+            uuid=client_uuid,
+            limit_hwid=hwid,
+        )
+    except Exception as e:
+        logger.error(f"Не удалось сохранить связку: {e}")
+
+    # Отправляем клиенту
+    delivered = True
+    try:
+        await context.bot.send_message(
+            chat_id=tg_id,
+            text=(
+                f"🎉 **Твоя подписка готова!**\n\n"
+                f"Панель: **{panel_name}**\n"
+                f"Логин: `{email}`\n\n"
+                f"**Ссылка подписки:**\n{sub_link}\n\n"
+                f"Кликни по ссылке — откроется браузер. "
+                f"Чтобы скопировать, удерживай палец на ссылке."
+            ),
+            parse_mode='Markdown',
+        )
+    except Exception as e:
+        delivered = False
+        logger.error(f"Не удалось отправить клиенту {tg_id}: {e}")
+
+    # Ответ админу
+    admin_msg = (
+        f"✅ **Клиент создан**\n\n"
+        f"TG ID: `{tg_id}`\n"
+        f"Email: `{email}`\n"
+        f"Панель: `{panel_name}`\n"
+        f"Инбаунды: `{inbound_ids}`\n"
+        f"HWID лимит: `{hwid}`\n"
+        f"UUID: `{client_uuid}`\n\n"
+        f"**Sub link:**\n`{sub_link}`"
+    )
+    if not delivered:
+        admin_msg += "\n\n⚠️ Не удалось доставить клиенту — возможно, он не запускал бота."
+
+    await update.message.reply_text(admin_msg, parse_mode='Markdown')
+    return ConversationHandler.END
+
+
+async def addclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("ac", None)
+    await update.message.reply_text("Создание клиента отменено.")
+    return ConversationHandler.END
+
+
+# --- /revoke и /listclients ---
+@admin_only
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Формат: /revoke <tg_id> [email]")
+        return
+
+    try:
+        tg_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("TG ID должен быть числом.")
+        return
+
+    email_filter = context.args[1].strip() if len(context.args) > 1 else None
+
+    bindings = get_user_bindings(tg_id)
+    if email_filter:
+        bindings = [b for b in bindings if b["email"] == email_filter]
+
+    if not bindings:
+        await update.message.reply_text("Не найдено связок для удаления.")
+        return
+
+    lines = ["**Удаляю клиентов:**\n"]
+    for b in bindings:
+        panel_name = b["panel_name"]
+        email = b["email"]
+
+        # Удаляем из панели
+        panel_ok = False
+        try:
+            async with _get_panel_api(panel_name) as api:
+                ok = await api.login()
+                if ok:
+                    panel_ok = await api.delete_client(email)
+        except Exception as e:
+            logger.error(f"Ошибка удаления из панели '{panel_name}/{email}': {e}")
+
+        # Удаляем из БД
+        db_ok = delete_binding(tg_id, panel_name, email)
+
+        mark_panel = "✅" if panel_ok else "❌"
+        mark_db = "✅" if db_ok else "❌"
+        lines.append(f"- `{panel_name}/{email}` — панель: {mark_panel}, БД: {mark_db}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
 @admin_only
-async def resetpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сбрасывает трафик для конкретной панели вручную."""
-    if not context.args:
-        await update.message.reply_text("Формат: /resetpanel <имя панели>")
+async def listclients_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bindings = list_all_bindings()
+    if not bindings:
+        await update.message.reply_text("Пока нет ни одного выданного клиента.")
         return
-    panel_name = context.args[0]
-    panel_config = config.get_panel_config(panel_name)
-    if not panel_config:
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
+
+    lines = ["**Выданные клиенты:**\n"]
+    for b in bindings:
+        lines.append(
+            f"- `{b['panel_name']}/{b['email']}` — TG `{b['tg_id']}`, "
+            f"HWID `{b['limit_hwid']}`, инбаунды `{b['inbound_ids']}`"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+# --- Клиентские команды ---
+@authorized
+async def mylink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет клиенту его sub-ссылку(-и)."""
+    tg_id = update.effective_user.id
+    bindings = get_user_bindings(tg_id)
+    if not bindings:
+        await update.message.reply_text(
+            "У тебя пока нет выданных подписок. Обратись к администратору."
+        )
         return
-    await update.message.reply_text(f"Сбрасываю трафик панели '{panel_name}'...")
-    initiator = update.effective_user
-    init_name = initiator.full_name or initiator.username or str(initiator.id)
-    async with XUIApi(panel_config["url"], panel_config["username"], panel_config["password"]) as api:
-        success = await api.reset_all_client_traffic()
-    if success:
-        await update.message.reply_text(f"✅ Трафик панели '{panel_name}' успешно сброшен!")
-        msg = f"✅ **{panel_name}**: трафик сброшен! (вручную, инициатор: {init_name})"
-    else:
-        await update.message.reply_text(f"❌ Не удалось сбросить трафик панели '{panel_name}'!")
-        msg = f"❌ **{panel_name}**: не удалось сбросить трафик! (вручную, инициатор: {init_name})"
-    # Рассылаем результат остальным админам (инициатор уже получил ответ выше)
-    for uid in config.get_admin_users():
-        if uid == update.effective_user.id:
+
+    lines = ["🔗 **Твои ссылки подписки:**\n"]
+    for b in bindings:
+        panel_config = config.get_panel_config(b["panel_name"])
+        sub_url = panel_config.get("sub_url", "").rstrip("/")
+        if sub_url:
+            link = f"{sub_url}/{b['sub_id']}"
+            lines.append(f"**{b['panel_name']}** ({b['email']}):\n`{link}`\n")
+        else:
+            lines.append(f"**{b['panel_name']}** ({b['email']}): sub_url не настроен\n")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+@authorized
+async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает клиенту его трафик по каждой связке."""
+    tg_id = update.effective_user.id
+    bindings = get_user_bindings(tg_id)
+    if not bindings:
+        await update.message.reply_text(
+            "У тебя пока нет выданных подписок. Обратись к администратору."
+        )
+        return
+
+    accounting_mode = config.get_accounting_mode()
+    lines = ["📊 **Твой трафик:**\n"]
+
+    for b in bindings:
+        success, result = await query_user_data(b["panel_name"], b["email"])
+        if not success:
+            lines.append(f"**{b['panel_name']}** ({b['email']}): ⚠️ {result}\n")
             continue
-        try:
-            await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Не удалось уведомить администратора {uid}: {e}")
+
+        used_gb = result["used_gb"]
+        total_gb = result["total_gb"]
+        if accounting_mode == "bidirectional":
+            try:
+                used_gb = f"{float(used_gb) * 2:.2f}"
+                total_gb = f"{float(total_gb) * 2:.2f}"
+            except (ValueError, TypeError):
+                pass
+
+        lines.append(
+            f"**{b['panel_name']}** ({b['email']}):\n"
+            f"- Трафик: {used_gb} GB / {total_gb} GB\n"
+            f"- Срок действия: {result['expiry_date']}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
-# --- Диалог настройки ---
-SET_NAME, SET_URL, SET_USERNAME, SET_PASSWORD = range(4)
+# --- Диалог настройки панели ---
+SET_NAME, SET_URL, SET_USERNAME, SET_PASSWORD, SET_SUB_URL = range(5)
 
 
 @admin_only
@@ -409,39 +726,89 @@ async def setting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['panel_name'] = update.message.text.strip()
-    await update.message.reply_text("Введите URL панели 3x-ui:")
+    await update.message.reply_text("Введите URL панели (с префиксом, например https://ip:port/XXXXXX):")
     return SET_URL
 
 
 async def set_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['panel_url'] = update.message.text.strip()
+    url = update.message.text.strip()
+    ok, err = config._validate_panel_url(url)
+    if not ok:
+        await update.message.reply_text(f"❌ {err}\nПопробуй снова:")
+        return SET_URL
+    context.user_data['panel_url'] = url
     await update.message.reply_text("Введите логин панели:")
     return SET_USERNAME
 
 
 async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['panel_username'] = update.message.text.strip()
-    await update.message.reply_text("Введите пароль панели:")
+    prompt = await update.message.reply_text(
+        "Введите пароль панели.\n"
+        "⚠️ Сообщение с паролем будет автоматически удалено из чата."
+    )
+    context.user_data['prompt_msg_id'] = prompt.message_id
     return SET_PASSWORD
 
 
 async def set_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Сохраняем пароль в память диалога ДО удаления сообщения
     context.user_data['panel_password'] = update.message.text.strip()
+
+    # Удаляем сообщение с паролем
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение с паролем: {e}")
+
+    # Удаляем сообщение-приглашение "Введите пароль панели"
+    prompt_msg_id = context.user_data.pop('prompt_msg_id', None)
+    if prompt_msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id, message_id=prompt_msg_id
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось удалить приглашение с паролем: {e}")
+
+    await update.message.reply_text(
+        "🔒 Сообщение с паролем удалено из чата.\n"
+        "Введите URL подписки (например https://ip:2096/sub), или /skip:"
+    )
+    return SET_SUB_URL
+
+
+async def set_sub_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text.lower() in ("/skip", "skip", "пропустить"):
+        sub_url = ""
+    else:
+        ok, err = config._validate_panel_url(text)
+        if not ok:
+            await update.message.reply_text(
+                f"❌ sub_url: {err}\nВведи снова или /skip:"
+            )
+            return SET_SUB_URL
+        sub_url = text
+
     name = context.user_data['panel_name']
     url = context.user_data['panel_url']
     username = context.user_data['panel_username']
     password = context.user_data['panel_password']
+
     await update.message.reply_text("Пытаюсь подключиться к панели...")
 
-    async with XUIApi(url, username, password) as api:
+    async with XUIApi(url, username, password, sub_url=sub_url) as api:
         connected = await api.login()
     if connected:
-        config.add_or_update_panel(name, url, username, password)
-        await update.message.reply_text(f"✅ Панель '{name}' подключена! Конфигурация сохранена.")
+        try:
+            config.add_or_update_panel(name, url, username, password, sub_url=sub_url)
+            await update.message.reply_text(f"✅ Панель '{name}' подключена! Конфигурация сохранена.")
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Ошибка сохранения: {e}")
     else:
         await update.message.reply_text("❌ Не удалось подключиться! Проверьте данные и повторите через /setting.")
     return ConversationHandler.END
-
 
 async def cancel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Настройка отменена.")
@@ -461,7 +828,7 @@ async def record_traffic_job(context: ContextTypes.DEFAULT_TYPE):
     for name, pconf in all_panels.items():
         if pconf.get("disabled", False):
             continue
-        async with XUIApi(pconf["url"], pconf["username"], pconf["password"]) as api:
+        async with _get_panel_api(name) as api:
             clients = await api.get_all_clients()
         for c in clients:
             if not c["email"]:
@@ -521,11 +888,9 @@ async def _generate_daily_report_text() -> str:
     yesterday = report_day.strftime("%Y-%m-%d")
     baseline_day = (report_day - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Для кумулятивного счётчика нужны снимки конца дня за оба дня.
     if not has_daily_traffic_snapshot(yesterday) or not has_daily_traffic_snapshot(baseline_day):
         return _format_daily_report_text(yesterday, [], [], {})
 
-    # Используем данные за вчера (полный день).
     stats = get_daily_stats(yesterday, yesterday)
     panel_stats = get_panel_daily_stats(yesterday, yesterday)
     top_users_by_panel = {
@@ -546,8 +911,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     report_text = await _generate_daily_report_text()
-    admin_users = config.get_admin_users()
-    for uid in admin_users:
+    for uid in config.get_admin_users():
         try:
             await context.bot.send_message(chat_id=uid, text=report_text, parse_mode='Markdown')
         except Exception as e:
@@ -556,7 +920,6 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ручной запуск дневного отчёта."""
     report_text = await _generate_daily_report_text()
     await update.message.reply_text(report_text, parse_mode='Markdown')
 
@@ -572,11 +935,17 @@ async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
     for name, pconf in all_panels.items():
         if pconf.get("disabled", False):
             continue
-        async with XUIApi(pconf["url"], pconf["username"], pconf["password"]) as api:
+        async with _get_panel_api(name) as api:
             if not await api.login():
                 logger.error(f"Панель '{name}': не удалось подключиться. Отправляем алерт.")
                 for uid in admin_users:
-                    await context.bot.send_message(chat_id=uid, text=f"🚨 **Панель '{name}' недоступна**", parse_mode='Markdown')
+                    try:
+                        await context.bot.send_message(
+                            chat_id=uid, text=f"🚨 **Панель '{name}' недоступна**",
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        pass
                 continue
             inbounds_data = await api.get_inbounds()
         if inbounds_data and inbounds_data.get("success"):
@@ -584,10 +953,21 @@ async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
             for inbound in inbounds_data.get("obj", []):
                 expiry_ts = inbound.get("expiryTime", 0)
                 if 0 < expiry_ts < three_days_later:
-                    expiry_date = datetime.fromtimestamp(expiry_ts / 1000, SCHEDULE_TIMEZONE).strftime('%Y-%m-%d')
-                    message = f"🔔 **Напоминание об истечении ({name})** 🔔\n- Описание: {inbound.get('remark', 'N/A')}\n- Истекает: {expiry_date}"
+                    expiry_date = datetime.fromtimestamp(
+                        expiry_ts / 1000, SCHEDULE_TIMEZONE
+                    ).strftime('%Y-%m-%d')
+                    message = (
+                        f"🔔 **Напоминание об истечении ({name})** 🔔\n"
+                        f"- Описание: {inbound.get('remark', 'N/A')}\n"
+                        f"- Истекает: {expiry_date}"
+                    )
                     for uid in admin_users:
-                        await context.bot.send_message(chat_id=uid, text=message, parse_mode='Markdown')
+                        try:
+                            await context.bot.send_message(
+                                chat_id=uid, text=message, parse_mode='Markdown'
+                            )
+                        except Exception:
+                            pass
 
 
 async def traffic_reset_job(context: ContextTypes.DEFAULT_TYPE):
@@ -603,14 +983,13 @@ async def traffic_reset_job(context: ContextTypes.DEFAULT_TYPE):
             continue
         reset_day = config.get_panel_reset_day(name)
         if reset_day is None:
-            # Проверка глобального ежемесячного сброса
             if not config.is_monthly_reset_enabled():
                 continue
             reset_day = 1
         if today.day != reset_day:
             continue
         logger.info(f"Сбрасываю трафик панели '{name}' в день {reset_day}.")
-        async with XUIApi(pconf["url"], pconf["username"], pconf["password"]) as api:
+        async with _get_panel_api(name) as api:
             reset_success = await api.reset_all_client_traffic()
         if reset_success:
             msg = f"✅ **{name}**: трафик сброшен! (день сброса: {reset_day})"
@@ -619,15 +998,35 @@ async def traffic_reset_job(context: ContextTypes.DEFAULT_TYPE):
             msg = f"❌ **{name}**: не удалось сбросить трафик!"
             logger.error(f"Ошибка сброса трафика панели: {name}")
         for uid in admin_users:
-            await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
+            try:
+                await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
+            except Exception:
+                pass
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Логирует любые исключения в хендлерах и говорит пользователю, что что-то сломалось."""
+    logger.error("Исключение при обработке апдейта:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Внутренняя ошибка. Администратор уже видит её в логах."
+            )
+        except Exception:
+            pass
 
 
 async def post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "🚀 Начать работу с ботом"),
         BotCommand("help", "ℹ️ Справка"),
-        BotCommand("query", "🔍 Информация о ноде (пользователи)"),
+        BotCommand("mylink", "🔗 Ссылка подписки (клиенты)"),
+        BotCommand("mystatus", "📊 Мой трафик (клиенты)"),
         BotCommand("setting", "⚙️ Добавить/обновить панель (админ)"),
+        BotCommand("inbounds", "📡 Список инбаундов панели (админ)"),
+        BotCommand("addclient", "🆕 Создать клиента (админ)"),
+        BotCommand("revoke", "🗑️ Удалить клиента (админ)"),
+        BotCommand("listclients", "📋 Список выданных клиентов (админ)"),
         BotCommand("status", "📊 Статус панели (админ)"),
         BotCommand("listpanels", "📋 Список панелей (админ)"),
         BotCommand("delpanel", "🗑️ Удалить панель (админ)"),
@@ -641,17 +1040,6 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(commands)
 
 
-def run_web_app():
-    logger.info("Запуск веб-приложения через Gunicorn...")
-    command = ["gunicorn", "--workers", "2", "--timeout", "120", "--bind", "0.0.0.0:5000", "webapp:app"]
-    try:
-        subprocess.Popen(command)
-        logger.info("Веб-приложение успешно запущено.")
-    except FileNotFoundError:
-        logger.error("Gunicorn не найден.")
-        sys.exit(1)
-
-
 def main() -> None:
     bot_token = config.get_bot_token()
     if not bot_token or bot_token == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -660,8 +1048,7 @@ def main() -> None:
 
     application = Application.builder().token(bot_token).build()
     application.post_init = post_init
-
-    run_web_app()
+    application.add_error_handler(error_handler)
 
     job_queue = application.job_queue
     if job_queue:
@@ -673,21 +1060,38 @@ def main() -> None:
     else:
         logger.warning("JobQueue не инициализирован.")
 
-    conv_handler = ConversationHandler(
+    # Диалог /setting
+    conv_setting = ConversationHandler(
         entry_points=[CommandHandler("setting", setting_start)],
         states={
             SET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
             SET_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_url)],
             SET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_username)],
             SET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_password)],
+            SET_SUB_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sub_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel_setting)],
     )
-    application.add_handler(conv_handler)
+
+    # Диалог /addclient
+    conv_addclient = ConversationHandler(
+        entry_points=[CommandHandler("addclient", addclient_start)],
+        states={
+            AC_HWID: [MessageHandler(filters.TEXT & ~filters.COMMAND, addclient_hwid)],
+        },
+        fallbacks=[CommandHandler("cancel", addclient_cancel)],
+    )
+
+    application.add_handler(conv_setting)
+    application.add_handler(conv_addclient)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("query", query_command))
+    application.add_handler(CommandHandler("inbounds", inbounds_command))
+    application.add_handler(CommandHandler("mylink", mylink_command))
+    application.add_handler(CommandHandler("mystatus", mystatus_command))
+    application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CommandHandler("listclients", listclients_command))
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("deluser", deluser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))

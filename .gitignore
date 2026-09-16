@@ -1,15 +1,35 @@
-# IDE
-.idea/
+# Конфигурация с секретами
+config.yml
+
+# База данных
+data/
+*.db
+*.db-shm
+*.db-wal
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.egg-info/
+.pytest_cache/
 
-# Config
-config.yml
+# Виртуальное окружение
+.venv/
+venv/
+env/
 
-# Runtime data & backups (may contain real user emails / traffic)
-data/
-*.bak.*
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Сертификаты
+certs/*
+!certs/.gitkeep

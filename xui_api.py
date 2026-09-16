@@ -1,12 +1,14 @@
 import httpx
 import logging
 import re
+import ssl
 import uuid as uuid_module
 from typing import Dict, Any, Optional, List
+from urllib.parse import quote as url_quote, urlparse
 
 logger = logging.getLogger(__name__)
 
-# CSRF-токен в HTML может быть в двух порядках атрибутов
+# CSRF-токен в HTML — в двух возможных порядках атрибутов
 CSRF_PATTERNS = [
     re.compile(
         r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
@@ -23,10 +25,11 @@ class XUIApi:
     """
     Клиент для панели 3x-ui 3.8.0+.
 
-    Ключевые моменты версии 3.8.0:
+    Особенности 3.8.0:
       - Клиент может быть привязан сразу к нескольким инбаундам.
       - Создание клиента: POST <base>/panel/api/clients/add
-      - Логин: сначала GET / (получаем cookie + CSRF из HTML), затем POST /login.
+      - Удаление клиента: POST <base>/panel/api/clients/del/<email>
+      - Логин: сначала GET / (получаем cookie + CSRF), затем POST /login.
       - POST-запросы требуют X-Csrf-Token и X-Requested-With.
       - URL панели может содержать кастомный base-path (например, /x8UGpUW143YI9P3JVyQm).
     """
@@ -36,9 +39,35 @@ class XUIApi:
         self.sub_url = (sub_url or "").rstrip('/')
         self.username = username
         self.password = password
-        self.client = httpx.AsyncClient(verify=False, timeout=30, follow_redirects=True)
+        verify = self._resolve_verify_setting()
+        self.client = httpx.AsyncClient(verify=verify, timeout=30, follow_redirects=True)
         self.csrf_token: Optional[str] = None
         self._logged_in = False
+
+    def _resolve_verify_setting(self):
+        """
+        Определяет режим проверки SSL для httpx.
+
+        - 127.0.0.1 / localhost / ::1
+              → verify=False (безопасно: трафик не покидает машину)
+
+        - внешний адрес
+              → SSLContext с обычной проверкой цепочки через системные корни,
+                но с check_hostname=False. Это нужно, потому что панель
+                обычно доступна по IP, а сертификат выписан на домен.
+                Цепочка сертификата при этом проверяется полностью —
+                MITM с самоподписанным сертификатом не пройдёт.
+        """
+        host = (urlparse(self.base_url).hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            logger.info("Локальный адрес — SSL-проверка отключена (безопасно).")
+            return False
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        # verify_mode = CERT_REQUIRED по умолчанию — цепочка проверяется.
+        logger.info("Внешний адрес — проверка цепочки через системные корни.")
+        return ctx
 
     async def __aenter__(self):
         return self
@@ -60,20 +89,17 @@ class XUIApi:
     # ---- CSRF и логин ----
 
     async def _bootstrap(self) -> bool:
-        """
-        Шаг 1: GET / — сервер выдаёт сессионную cookie и HTML с CSRF-токеном.
-        Cookie автоматически сохраняется в self.client.cookies.
-        """
+        """GET / — сервер выдаёт cookie и HTML с CSRF-токеном."""
         try:
             response = await self.client.get(f"{self.base_url}/")
-            if response.status_code != 200:
+            if response.status_code not in (200, 307):
                 logger.error(f"Bootstrap: HTTP {response.status_code}")
                 return False
             for pattern in CSRF_PATTERNS:
                 match = pattern.search(response.text)
                 if match:
                     self.csrf_token = match.group(1)
-                    logger.info("CSRF-токен получен из HTML.")
+                    logger.debug("CSRF-токен получен из HTML.")
                     return True
             logger.warning("CSRF-токен не найден в HTML главной страницы.")
             return False
@@ -82,17 +108,10 @@ class XUIApi:
             return False
 
     async def login(self) -> bool:
-        """
-        Полный цикл входа:
-          1. GET / → cookie + CSRF
-          2. POST /login (form-urlencoded) с cookie + X-Csrf-Token
-          3. GET / → обновление CSRF после логина
-        """
-        # 1. Bootstrap: получаем cookie + CSRF
+        """Полный цикл входа: GET / → POST /login → GET /."""
         if not await self._bootstrap():
             return False
 
-        # 2. Логин
         login_url = f"{self.base_url}/login"
         try:
             response = await self.client.post(
@@ -113,7 +132,7 @@ class XUIApi:
                 return False
             logger.info("Логин успешен.")
 
-            # 3. После логина CSRF мог обновиться — забираем свежий
+            # После логина CSRF мог измениться
             self.csrf_token = None
             await self._bootstrap()
             self._logged_in = True
@@ -143,7 +162,6 @@ class XUIApi:
             else:
                 response = await self.client.post(url, **kwargs)
 
-            # При 403 обновим CSRF и попробуем один раз
             if response.status_code == 403:
                 logger.warning(f"403 на {method} {path}, обновляю CSRF и повторяю.")
                 self.csrf_token = None
@@ -163,15 +181,18 @@ class XUIApi:
 
     # ---- Инбаунды ----
 
-    async def get_inbounds_list(self) -> List[Dict[str, Any]]:
-        """Возвращает список инбаундов: id, remark, protocol, port, enable."""
+    async def get_inbounds(self) -> Optional[Dict[str, Any]]:
+        """Сырой ответ /panel/api/inbounds/list (используется задачами)."""
         if not await self._ensure_session():
-            return []
-        data = await self._request("GET", "/panel/api/inbounds/list")
+            return None
+        return await self._request("GET", "/panel/api/inbounds/list")
+
+    async def get_inbounds_list(self) -> List[Dict[str, Any]]:
+        """Список инбаундов: id, remark, protocol, port, enable."""
+        data = await self.get_inbounds()
         if not data or not data.get("success"):
             logger.error(f"Не удалось получить список инбаундов: {data}")
             return []
-        inbounds = data.get("obj", []) or []
         return [
             {
                 "id": ib.get("id"),
@@ -180,8 +201,36 @@ class XUIApi:
                 "port": ib.get("port"),
                 "enable": ib.get("enable", True),
             }
-            for ib in inbounds
+            for ib in (data.get("obj") or [])
         ]
+
+    # ---- Статус сервера ----
+
+    async def get_server_status(self) -> Optional[Dict[str, Any]]:
+        """Статус сервера (CPU, RAM, диск, Xray и т.д.)."""
+        if not await self._ensure_session():
+            return None
+        data = await self._request("GET", "/panel/api/server/status")
+        return data.get("obj") if data else None
+
+    # ---- Все клиенты ----
+
+    async def get_all_clients(self) -> List[Dict[str, Any]]:
+        """Плоский список всех клиентов всех инбаундов."""
+        data = await self.get_inbounds()
+        if not data or not data.get("success"):
+            return []
+        clients: List[Dict[str, Any]] = []
+        for inbound in (data.get("obj") or []):
+            for cs in (inbound.get("clientStats") or []):
+                clients.append({
+                    "email": cs.get("email", ""),
+                    "up": cs.get("up", 0),
+                    "down": cs.get("down", 0),
+                    "total": cs.get("total", 0),
+                    "expiryTime": cs.get("expiryTime", 0),
+                })
+        return clients
 
     # ---- Создание клиента ----
 
@@ -196,7 +245,7 @@ class XUIApi:
         total_gb: int = 0,
         expiry_time: int = 0,
     ) -> bool:
-        """Создаёт клиента и привязывает его к указанным инбаундам."""
+        """Создаёт клиента и привязывает к указанным инбаундам."""
         if not await self._ensure_session():
             return False
         if not inbound_ids:
@@ -243,12 +292,22 @@ class XUIApi:
         """Удаляет клиента по email (панель сама найдёт его во всех инбаундах)."""
         if not await self._ensure_session():
             return False
-        data = await self._request("POST", f"/panel/api/clients/del/{email}")
+        safe_email = url_quote(email, safe="")
+        data = await self._request("POST", f"/panel/api/clients/del/{safe_email}")
         if data and data.get("success"):
             logger.info(f"Клиент '{email}' удалён.")
             return True
         logger.error(f"Ошибка удаления клиента '{email}': {data}")
         return False
+
+    # ---- Сброс трафика ----
+
+    async def reset_all_client_traffic(self) -> bool:
+        """Сбрасывает трафик всем клиентам всех инбаундов."""
+        if not await self._ensure_session():
+            return False
+        data = await self._request("POST", "/panel/api/inbounds/resetAllClientTraffics/-1")
+        return data is not None and data.get("success", False)
 
     # ---- Sub-ссылка ----
 

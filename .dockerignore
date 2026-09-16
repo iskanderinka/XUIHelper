@@ -1,11 +1,33 @@
-.git
-.gitignore
-.idea
-__pycache__
-*.py[cod]
-*.bak.*
-.env*
+# Секреты и данные
 config.yml
 data/
-docs/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Документация и тесты (не нужны в образе)
 tests/
+*.md
+
+# Сертификаты
+certs/*
+!certs/.gitkeep

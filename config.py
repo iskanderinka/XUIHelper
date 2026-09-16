@@ -13,6 +13,56 @@ DEFAULT_CONFIG = {
     "panels": {}
 }
 
+from urllib.parse import urlparse
+
+
+def _validate_panel_url(url: str) -> tuple:
+    """
+    Проверяет, что URL панели безопасен и валиден.
+
+    Возвращает (True, "") при успехе,
+              (False, "сообщение об ошибке") при провале.
+    """
+    if not url or not isinstance(url, str):
+        return False, "URL не может быть пустым."
+
+    url = url.strip()
+
+    if len(url) > 500:
+        return False, "URL слишком длинный (максимум 500 символов)."
+
+    if any(c.isspace() for c in url):
+        return False, "URL не должен содержать пробелы."
+
+    # Управляющие символы ASCII (0x00-0x1F)
+    if any(ord(c) < 32 for c in url):
+        return False, "URL содержит недопустимые управляющие символы."
+
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        return False, f"Не удалось разобрать URL: {e}"
+
+    if parsed.scheme not in ("http", "https"):
+        return False, "Разрешены только схемы http:// и https://."
+
+    if not parsed.hostname:
+        return False, "В URL не указан хост."
+
+    if parsed.username or parsed.password:
+        return False, "URL не должен содержать логин и пароль (user:pass@host)."
+
+    # parsed.port — ленивое свойство, может бросить ValueError
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "Порт должен быть в диапазоне 1–65535."
+
+    if port is not None and not (1 <= port <= 65535):
+        return False, "Порт должен быть в диапазоне 1–65535."
+
+    return True, ""
+
 
 def get_config() -> Dict[str, Any]:
     """Загружает конфигурацию из config.yml."""
@@ -20,7 +70,6 @@ def get_config() -> Dict[str, Any]:
         save_config(DEFAULT_CONFIG)
         print(f"Файл '{CONFIG_FILE}' не найден. Создан файл конфигурации по умолчанию.")
         print("Отредактируйте его: укажите токен бота и ID пользователей.")
-        # Выход, так как токен обязателен
         exit()
 
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -32,56 +81,182 @@ def save_config(config_data: Dict[str, Any]):
     global config
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         yaml.dump(config_data, f, allow_unicode=True, sort_keys=False)
-    config = config_data  # Немедленно обновляем конфигурацию в памяти
+    config = config_data
 
 
 # Загружаем конфигурацию при импорте
 config = get_config()
 
-# --- Вспомогательные функции для доступа к значениям конфигурации ---
+
+# ---------- Доступ к общим полям ----------
 
 def get_bot_token() -> str:
     return config.get("bot_token", "")
 
 
 def get_admin_users() -> List[int]:
-    return config.get("users", {}).get("admin_users", [])
+    users = config.get("users", {}).get("admin_users") or []
+    if not isinstance(users, list):
+        users = [users] if users else []
+    result = []
+    for u in users:
+        try:
+            result.append(int(u))
+        except (ValueError, TypeError):
+            continue
+    return result
 
 
 def get_normal_users() -> List[int]:
-    return config.get("users", {}).get("normal_users", [])
-
-
-def get_panel_config(name: str) -> Dict[str, str]:
-    """Возвращает конфигурацию конкретной панели по имени."""
-    return config.get("panels", {}).get(name, {})
-
-
-def get_all_panels() -> Dict[str, Any]:
-    """Возвращает все настроенные панели."""
-    return config.get("panels", {})
-
-
-def delete_panel(name: str) -> bool:
-    """Удаляет конфигурацию панели по имени."""
-    current_config = get_config()
-    if "panels" in current_config and name in current_config["panels"]:
-        del current_config["panels"][name]
-        save_config(current_config)
-        return True
-    return False
+    users = config.get("users", {}).get("normal_users") or []
+    if not isinstance(users, list):
+        users = [users] if users else []
+    result = []
+    for u in users:
+        try:
+            result.append(int(u))
+        except (ValueError, TypeError):
+            continue
+    return result
 
 
 def is_admin(user_id: int) -> bool:
-    """Проверяет, является ли пользователь администратором."""
     return user_id in get_admin_users()
 
 
 def is_authorized(user_id: int) -> bool:
-    """Проверяет, авторизован ли пользователь (админ или обычный)."""
     return is_admin(user_id) or user_id in get_normal_users()
 
 
+# ---------- Управление пользователями ----------
+
+def add_normal_user(user_id: int) -> bool:
+    """Добавляет ID в список обычных пользователей. False, если уже есть."""
+    user_id = int(user_id)
+    current = get_config()
+    current.setdefault("users", {}).setdefault("normal_users", [])
+    if user_id in current["users"]["normal_users"]:
+        return False
+    current["users"]["normal_users"].append(user_id)
+    save_config(current)
+    return True
+
+
+def del_normal_user(user_id: int) -> bool:
+    """Удаляет ID из списка обычных пользователей. False, если не было."""
+    user_id = int(user_id)
+    current = get_config()
+    users = current.get("users", {})
+    if user_id not in users.get("normal_users", []):
+        return False
+    users["normal_users"].remove(user_id)
+    save_config(current)
+    return True
+
+
+# ---------- Панели ----------
+
+def get_panel_config(name: str) -> Dict[str, str]:
+    """Возвращает конфигурацию панели по имени."""
+    return config.get("panels", {}).get(name, {})
+
+
+def get_all_panels() -> Dict[str, Any]:
+    """Возвращает все панели."""
+    return config.get("panels", {})
+
+
+def add_or_update_panel(name: str, url: str, username: str, password: str,
+                        reset_day: int = None, sub_url: str = None) -> None:
+    """
+    Создаёт или обновляет панель. Бросает ValueError при невалидном URL.
+    """
+    ok, err = _validate_panel_url(url)
+    if not ok:
+        raise ValueError(err)
+
+    if sub_url:
+        ok, err = _validate_panel_url(sub_url)
+        if not ok:
+            raise ValueError(f"sub_url: {err}")
+
+    current = get_config()
+    panels = current.setdefault("panels", {})
+    existing = panels.get(name, {})
+
+    panel = dict(existing)
+    panel["url"] = url
+    panel["username"] = username
+    panel["password"] = password
+    if reset_day is not None:
+        panel["reset_day"] = int(reset_day)
+    if sub_url is not None:
+        panel["sub_url"] = sub_url
+
+    panels[name] = panel
+    save_config(current)
+
+
+def delete_panel(name: str) -> bool:
+    """Удаляет панель по имени."""
+    current = get_config()
+    if "panels" in current and name in current["panels"]:
+        del current["panels"][name]
+        save_config(current)
+        return True
+    return False
+
+
+def set_panel_disabled(name: str, disabled: bool) -> bool:
+    """Включает/отключает панель. False, если панели нет."""
+    current = get_config()
+    panels = current.get("panels", {})
+    if name not in panels:
+        return False
+    panels[name]["disabled"] = bool(disabled)
+    save_config(current)
+    return True
+
+
+def get_panel_reset_day(name: str):
+    """Возвращает день сброса для панели или None, если не задан."""
+    panel = get_panel_config(name)
+    reset_day = panel.get("reset_day")
+    if reset_day is None:
+        return None
+    try:
+        return int(reset_day)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------- Автоматизация ----------
+
 def is_monthly_reset_enabled() -> bool:
-    """Проверяет, включён ли ежемесячный автосброс трафика."""
     return config.get("monthly_reset", {}).get("enable", False)
+
+
+def is_daily_report_enabled() -> bool:
+    return config.get("daily_report", {}).get("enable", False)
+
+
+def get_daily_report_hour() -> int:
+    """Час отправки дневного отчёта (0-23). По умолчанию 8."""
+    hour = config.get("daily_report", {}).get("hour", 8)
+    try:
+        hour = int(hour)
+    except (ValueError, TypeError):
+        hour = 8
+    if hour < 0 or hour > 23:
+        hour = 8
+    return hour
+
+
+# ---------- Учёт трафика ----------
+
+def get_accounting_mode() -> str:
+    """'unidirectional' или 'bidirectional'. По умолчанию — первый."""
+    mode = config.get("traffic", {}).get("accounting_mode", "unidirectional")
+    if mode not in ("unidirectional", "bidirectional"):
+        return "unidirectional"
+    return mode
