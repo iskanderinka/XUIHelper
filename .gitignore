@@ -1,0 +1,15 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Config
+config.yml
+
+# Runtime data & backups (may contain real user emails / traffic)
+data/
+*.bak.*
