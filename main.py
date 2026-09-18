@@ -28,7 +28,7 @@ from database import (
     get_daily_stats, get_panel_daily_stats, get_top_users, has_daily_traffic_snapshot,
     upsert_bot_user, is_bot_user,
     save_binding, get_user_bindings, get_binding_by_email,
-    delete_binding, list_all_bindings,
+    delete_binding, list_all_bindings, list_all_bindings_with_users,
     has_recent_notification, log_notification,
     set_binding_paused, update_binding_expiry,
 )
@@ -42,6 +42,10 @@ logging.getLogger("xui_api").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 SCHEDULE_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
+
+# Ссылки на активные ConversationHandler — чтобы можно было отменять их программно
+_conv_setting_ref: Optional[ConversationHandler] = None
+_conv_addclient_ref: Optional[ConversationHandler] = None
 
 
 def _scheduled_time(hour: int, minute: int = 0) -> time:
@@ -107,6 +111,16 @@ def _get_panel_api(panel_name: str) -> XUIApi:
         sub_url=panel_config.get("sub_url", ""),
     )
 
+def _abort_conversation(update: Update, conv: Optional[ConversationHandler]) -> None:
+    """Принудительно завершает ConversationHandler для текущего пользователя."""
+    if conv is None:
+        return
+    try:
+        key = conv._get_key(update)
+        conv._conversations.pop(key, None)
+    except Exception as e:
+        logger.warning(f"Не удалось сбросить состояние диалога: {e}")
+
 
 # --- Декораторы ---
 def authorized(func):
@@ -122,8 +136,41 @@ def authorized(func):
 def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if not config.is_admin(update.effective_user.id):
+        user_id = update.effective_user.id
+        if not config.is_admin(user_id):
             await update.message.reply_text("Извините, эта команда доступна только администраторам.")
+            return
+        if not config.has_superadmin():
+            await update.message.reply_text(
+                "⚠️ Суперадмин не назначен.\n\n"
+                "Зайди на сервер и добавь ID суперадмина первым в "
+                "`users.admin_users` файла `config.yml`. После этого "
+                "команды станут доступны."
+            )
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+def superadmin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if not config.is_admin(user_id):
+            await update.message.reply_text("Извините, эта команда доступна только администраторам.")
+            return
+        if not config.has_superadmin():
+            await update.message.reply_text(
+                "⚠️ Суперадмин не назначен.\n\n"
+                "Зайди на сервер и добавь ID суперадмина первым в "
+                "`users.admin_users` файла `config.yml`."
+            )
+            return
+        if not config.is_superadmin(user_id):
+            await update.message.reply_text(
+                "🔒 Эта команда доступна только главному администратору "
+                "(первому в списке `admin_users`)."
+            )
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -158,19 +205,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     policy_line = "/policy - 🔒 Политика конфиденциальности\n" if config.get_policy_url() else ""
+    user_id = update.effective_user.id
 
-    if config.is_admin(update.effective_user.id):
-        help_text = (
+    if config.is_admin(user_id):
+        # Общие админские команды
+        common = (
             "**✨ Команды администратора:**\n"
             "/start - 🚀 Начать работу с ботом\n"
             "/help - ℹ️ Показать эту справку\n"
             f"{policy_line}"
-            "/setting - ⚙️ Добавить или обновить панель\n"
             "/listpanels - 📋 Список панелей со статусом\n"
-            "/delpanel <имя> - 🗑️ Удалить панель\n"
             "/status <панель> - 📊 Подробный статус панели\n"
-            "/setresetday <панель> <день> - 🔧 День сброса трафика (1-28)\n"
-            "/resetpanel <панель> - ⚡️ Немедленно сбросить трафик\n"
             "/inbounds <панель> - 📡 Список инбаундов с ID\n"
             "/addclient <tg_id> <email> <панель> <id1> [id2] ... - 🆕 Создать клиента\n"
             "/revoke <tg_id> [email] - 🗑️ Удалить клиента\n"
@@ -181,6 +226,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/getlink <tg_id> [email] - 🔗 Получить sub-ссылку клиента\n"
             "/report - 📈 Отправить дневной отчёт сейчас"
         )
+
+        # Если это суперадмин — добавим критичные команды
+        if config.is_superadmin(user_id):
+            common += (
+                "\n\n**🔐 Только суперадмин:**\n"
+                "/setting - ⚙️ Добавить или обновить панель\n"
+                "/delpanel <имя> - 🗑️ Удалить панель"
+            )
+
+        help_text = common
     else:
         help_text = (
             "**👋 Команды пользователя:**\n"
@@ -190,6 +245,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/mylink - 🔗 Получить ссылку подписки"
         )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
 
 # --- Админские команды по панелям ---
 @admin_only
@@ -236,9 +292,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         xray_status = xray.get('state', 'N/A')
         xray_version = xray.get('version', 'N/A')
 
-        reset_day = config.get_panel_reset_day(panel_name)
-        reset_info = f"- День сброса трафика: {reset_day}-е число" if reset_day else "- День сброса трафика: 1-е число (по умолчанию)"
-
         status_text = (
             f"**Статус панели {panel_name}**\n"
             f"- Версия Xray: `{xray_version}`\n"
@@ -248,7 +301,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"- Память: {_format_bytes(mem_current)} / {_format_bytes(mem_total)} ({mem_percent:.2f}%)\n"
             f"- Диск: {_format_bytes(disk_current)} / {_format_bytes(disk_total)} ({disk_percent:.2f}%)\n"
             f"- Время работы: {uptime_str}\n"
-            f"{reset_info}\n\n"
             f"**Сеть**\n"
             f"- Отдано: {_format_bytes(net_sent)}\n"
             f"- Принято: {_format_bytes(net_recv)}"
@@ -305,9 +357,7 @@ async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     lines = ["**Список панелей:**\n"]
     for name, pconf in all_panels.items():
-        reset_day = pconf.get("reset_day", "1 (по умолчанию)")
         lines.append(f"\n**{name}** — `{pconf['url']}`")
-        lines.append(f"  День сброса: {reset_day}-е число")
 
         # Отключённые панели не дёргаем — сразу помечаем
         if pconf.get("disabled", False):
@@ -329,7 +379,7 @@ async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
-@admin_only
+@superadmin_only
 async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Формат: /delpanel <имя панели>")
@@ -339,64 +389,6 @@ async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"🗑️ Панель '{panel_name}' успешно удалена.")
     else:
         await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
-
-
-@admin_only
-async def setresetday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text("Формат: /setresetday <имя панели> <день (1-28)>")
-        return
-    panel_name = context.args[0]
-    try:
-        day = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("День должен быть целым числом от 1 до 28.")
-        return
-    if day < 1 or day > 28:
-        await update.message.reply_text("День должен быть в диапазоне 1–28.")
-        return
-    panel_config = config.get_panel_config(panel_name)
-    if not panel_config:
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
-        return
-    try:
-        config.add_or_update_panel(
-            panel_name, panel_config["url"], panel_config["username"],
-            panel_config["password"], reset_day=day,
-            sub_url=panel_config.get("sub_url", ""),
-        )
-        await update.message.reply_text(f"✅ День сброса трафика панели '{panel_name}' установлен на {day}-е число.")
-    except ValueError as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
-@admin_only
-async def resetpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Формат: /resetpanel <имя панели>")
-        return
-    panel_name = context.args[0]
-    if not config.get_panel_config(panel_name):
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
-        return
-    await update.message.reply_text(f"Сбрасываю трафик панели '{panel_name}'...")
-    initiator = update.effective_user
-    init_name = initiator.full_name or initiator.username or str(initiator.id)
-    async with _get_panel_api(panel_name) as api:
-        success = await api.reset_all_client_traffic()
-    if success:
-        await update.message.reply_text(f"✅ Трафик панели '{panel_name}' успешно сброшен!")
-        msg = f"✅ **{panel_name}**: трафик сброшен! (вручную, инициатор: {init_name})"
-    else:
-        await update.message.reply_text(f"❌ Не удалось сбросить трафик панели '{panel_name}'!")
-        msg = f"❌ **{panel_name}**: не удалось сбросить трафик! (вручную, инициатор: {init_name})"
-    for uid in config.get_admin_users():
-        if uid == update.effective_user.id:
-            continue
-        try:
-            await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Не удалось уведомить администратора {uid}: {e}")
 
 
 # --- Хелперы для срока подписки ---
@@ -549,6 +541,52 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         await query.edit_message_text(f"❓ Неизвестное действие: {action}")
 
+async def clients_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Навигация по страницам /listclients и удаление сообщения по «Готово»."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+
+    if data == "clients:done":
+        # Удаляем сообщение со списком (к которому привязаны кнопки)
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить список клиентов: {e}")
+
+        # Удаляем исходную команду /listclients
+        cmd_msg_id = context.user_data.pop('clients_cmd_msg_id', None)
+        if cmd_msg_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=query.message.chat_id,
+                    message_id=cmd_msg_id,
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось удалить команду /listclients: {e}")
+        return
+
+    if not data.startswith("clients:page:"):
+        return
+
+    try:
+        page = int(data.split(":")[2])
+    except (IndexError, ValueError):
+        return
+
+    bindings = list_all_bindings_with_users()
+    if not bindings:
+        await query.edit_message_text("Пока нет ни одного выданного клиента.")
+        return
+
+    text, keyboard = _render_clients_page(bindings, page)
+    try:
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    except Exception as e:
+        # Telegram падает, если текст не изменился (нажали на ту же страницу)
+        logger.debug(f"edit_message_text: {e}")
+
 def _expiry_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура выбора срока подписки."""
     return InlineKeyboardMarkup([
@@ -601,6 +639,15 @@ AC_COMMENT = 3
 
 @admin_only
 async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Отменяем параллельный диалог /setting
+    _abort_conversation(update, _conv_setting_ref)
+    # Чистим его данные
+    for key in ('panel_name', 'panel_url', 'panel_username',
+                'panel_password', 'prompt_msg_id'):
+        context.user_data.pop(key, None)
+    # Чистим свои данные от предыдущей попытки
+    context.user_data.pop('ac', None)
+
     args = context.args
     if len(args) < 4:
         await update.message.reply_text(
@@ -1333,24 +1380,91 @@ async def _do_addclient(update, context, payload, query) -> None:
 
     await query.edit_message_text(admin_msg, parse_mode='Markdown')
 
+CLIENTS_PAGE_SIZE = 5
+def _format_client_binding(b: dict) -> str:
+    """Форматирует одну связку клиента для /listclients."""
+    username = b.get("bot_username")
+    first_name = b.get("bot_first_name")
+    if username:
+        user_line = f"👤 `@{username}`"
+    elif first_name:
+        user_line = f"👤 {first_name}"
+    else:
+        user_line = "👤 `без username`"
+
+    email = b.get("email") or "—"
+    panel_name = b.get("panel_name") or "—"
+    tg_id = b.get("tg_id")
+    hwid = b.get("limit_hwid", 0)
+    hwid_str = "безлимит" if hwid == 0 else str(hwid)
+
+    expiry = b.get("expiry_date") or "бессрочно"
+    status = "⏸️ приостановлена" if b.get("paused_at") else "▶️ активна"
+
+    lines = [
+        user_line,
+        f"✏️ `{email}`",
+        f"🎛️ `{panel_name}`",
+        f"🆔 `{tg_id}`",
+        f"📳 HWID `{hwid_str}`",
+        f"🗓️ до `{expiry}` · {status}",
+    ]
+    if b.get("comment"):
+        lines.append(f"💬 {b['comment']}")
+    return "\n".join(lines)
+
+
+def _clients_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Клавиатура навигации по страницам /listclients."""
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(
+            "◀️ Предыдущие", callback_data=f"clients:page:{page - 1}"
+        ))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(
+            "Следующие ▶️", callback_data=f"clients:page:{page + 1}"
+        ))
+
+    keyboard = []
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="clients:done")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _render_clients_page(bindings: list, page: int) -> tuple:
+    """Собирает текст и клавиатуру для страницы. Возвращает (text, keyboard)."""
+    total = len(bindings)
+    total_pages = max(1, (total + CLIENTS_PAGE_SIZE - 1) // CLIENTS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * CLIENTS_PAGE_SIZE
+    end = start + CLIENTS_PAGE_SIZE
+    chunk = bindings[start:end]
+
+    lines = [f"👥 **Список клиентов** (страница {page + 1}/{total_pages}):\n"]
+    for i, b in enumerate(chunk):
+        lines.append("───────────────")
+        lines.append(_format_client_binding(b))
+    lines.append("───────────────")
+
+    return "\n".join(lines), _clients_keyboard(page, total_pages)
+
+
 @admin_only
 async def listclients_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    bindings = list_all_bindings()
+    """Список всех выданных клиентов с пагинацией."""
+    bindings = list_all_bindings_with_users()
     if not bindings:
         await update.message.reply_text("Пока нет ни одного выданного клиента.")
         return
 
-    lines = ["**Выданные клиенты:**\n"]
-    for b in bindings:
-        expiry = b.get("expiry_date") or "бессрочно"
-        status = "⏸️" if b.get("paused_at") else "▶️"
-        comment = b.get("comment") or ""
-        comment_line = f"\n  💬 {comment}" if comment else ""
-        lines.append(
-            f"{status} `{b['panel_name']}/{b['email']}` — TG `{b['tg_id']}`, "
-            f"HWID `{b['limit_hwid']}`, до `{expiry}`{comment_line}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+    # Запоминаем id команды /listclients — удалим её по кнопке «Готово»
+    context.user_data['clients_cmd_msg_id'] = update.message.message_id
+
+    text, keyboard = _render_clients_page(bindings, 0)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
 
 # --- Политика конфиденциальности ---
 async def policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1473,8 +1587,18 @@ async def btn_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 SET_NAME, SET_URL, SET_USERNAME, SET_PASSWORD, SET_SUB_URL = range(5)
 
 
-@admin_only
+@superadmin_only
 async def setting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Отменяем параллельный диалог /addclient
+    _abort_conversation(update, _conv_addclient_ref)
+    # Чистим его данные
+    context.user_data.pop('ac', None)
+
+    # Чистим свои данные от предыдущей попытки
+    for key in ('panel_name', 'panel_url', 'panel_username',
+                'panel_password', 'prompt_msg_id'):
+        context.user_data.pop(key, None)
+
     await update.message.reply_text("Введите имя панели для добавления или обновления:")
     return SET_NAME
 
@@ -1726,39 +1850,6 @@ async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
                             pass
 
 
-async def traffic_reset_job(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет каждую панель на её день сброса и сбрасывает при необходимости."""
-    logger.info("Запуск задачи: traffic_reset_job")
-    all_panels = config.get_all_panels()
-    if not all_panels:
-        return
-    admin_users = config.get_admin_users()
-    today = datetime.now(SCHEDULE_TIMEZONE)
-    for name, pconf in all_panels.items():
-        if pconf.get("disabled", False):
-            continue
-        reset_day = config.get_panel_reset_day(name)
-        if reset_day is None:
-            if not config.is_monthly_reset_enabled():
-                continue
-            reset_day = 1
-        if today.day != reset_day:
-            continue
-        logger.info(f"Сбрасываю трафик панели '{name}' в день {reset_day}.")
-        async with _get_panel_api(name) as api:
-            reset_success = await api.reset_all_client_traffic()
-        if reset_success:
-            msg = f"✅ **{name}**: трафик сброшен! (день сброса: {reset_day})"
-            logger.info(f"Успешный сброс трафика панели: {name}")
-        else:
-            msg = f"❌ **{name}**: не удалось сбросить трафик!"
-            logger.error(f"Ошибка сброса трафика панели: {name}")
-        for uid in admin_users:
-            try:
-                await context.bot.send_message(chat_id=uid, text=msg, parse_mode='Markdown')
-            except Exception:
-                pass
-
 async def _send_client_expiry_notice(
     context: ContextTypes.DEFAULT_TYPE,
     tg_id: int,
@@ -1913,7 +2004,6 @@ def main() -> None:
         job_queue.run_daily(record_traffic_job, time=_scheduled_time(23, 50))
         report_hour = config.get_daily_report_hour()
         job_queue.run_daily(daily_report_job, time=_scheduled_time(report_hour))
-        job_queue.run_daily(traffic_reset_job, time=_scheduled_time(0, 5))
         job_queue.run_daily(expiry_notification_job, time=_scheduled_time(9, 0))
     else:
         logger.warning("JobQueue не инициализирован.")
@@ -1929,6 +2019,7 @@ def main() -> None:
             SET_SUB_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sub_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel_setting)],
+        name="setting",
     )
 
     # Диалог /addclient
@@ -1950,10 +2041,17 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", addclient_cancel)],
+        name="addclient",
     )
+
+    # Регистрируем ссылки для автоотмены параллельных диалогов
+    global _conv_setting_ref, _conv_addclient_ref
+    _conv_setting_ref = conv_setting
+    _conv_addclient_ref = conv_addclient
 
     # Callback-подтверждения — регистрируем ДО ConversationHandler
     application.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:(yes|no)$"))
+    application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
 
     application.add_handler(conv_setting)
     application.add_handler(conv_addclient)
@@ -1971,8 +2069,6 @@ def main() -> None:
     application.add_handler(CommandHandler("extendsub", extendsub_command))
     application.add_handler(CommandHandler("delpanel", delpanel_command))
     application.add_handler(CommandHandler("listpanels", listpanels_command))
-    application.add_handler(CommandHandler("setresetday", setresetday_command))
-    application.add_handler(CommandHandler("resetpanel", resetpanel_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(MessageHandler(
         filters.Regex("^🔗 Ссылка подписки$"), btn_my_link

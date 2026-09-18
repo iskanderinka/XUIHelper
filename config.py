@@ -162,34 +162,7 @@ def delete_panel(name: str) -> bool:
     return False
 
 
-def set_panel_disabled(name: str, disabled: bool) -> bool:
-    """Включает/отключает панель. False, если панели нет."""
-    current = get_config()
-    panels = current.get("panels", {})
-    if name not in panels:
-        return False
-    panels[name]["disabled"] = bool(disabled)
-    save_config(current)
-    return True
-
-
-def get_panel_reset_day(name: str):
-    """Возвращает день сброса для панели или None, если не задан."""
-    panel = get_panel_config(name)
-    reset_day = panel.get("reset_day")
-    if reset_day is None:
-        return None
-    try:
-        return int(reset_day)
-    except (ValueError, TypeError):
-        return None
-
-
 # ---------- Автоматизация ----------
-
-def is_monthly_reset_enabled() -> bool:
-    return config.get("monthly_reset", {}).get("enable", False)
-
 
 def is_daily_report_enabled() -> bool:
     return config.get("daily_report", {}).get("enable", False)
@@ -256,3 +229,24 @@ def get_tariffs_message() -> str:
     """Текст перед кнопкой тарифов. Если не задан — стандартный."""
     msg = (config.get("tariffs", {}).get("message") or "").strip()
     return msg if msg else DEFAULT_TARIFFS_MESSAGE
+
+# ---------- Суперадмин ----------
+
+def get_superadmin_id() -> int | None:
+    """
+    Возвращает ID суперадмина — первого в списке admin_users.
+    None, если список пуст.
+    """
+    admins = get_admin_users()
+    return admins[0] if admins else None
+
+
+def is_superadmin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь суперадмином."""
+    superadmin = get_superadmin_id()
+    return superadmin is not None and int(user_id) == superadmin
+
+
+def has_superadmin() -> bool:
+    """Есть ли вообще суперадмин в конфиге."""
+    return get_superadmin_id() is not None

@@ -556,3 +556,15 @@ def update_binding_comment(tg_id: int, panel_name: str, email: str,
     )
     conn.commit()
     conn.close()
+
+def list_all_bindings_with_users() -> List[Dict]:
+    """Как list_all_bindings, но подтягивает username и first_name из bot_users."""
+    conn = _get_conn()
+    rows = conn.execute(
+        """SELECT cb.*, bu.username AS bot_username, bu.first_name AS bot_first_name
+           FROM client_bindings cb
+           LEFT JOIN bot_users bu ON bu.tg_id = cb.tg_id
+           ORDER BY cb.panel_name, cb.email"""
+    ).fetchall()
+    conn.close()
+    return [_parse_binding_row(r) for r in rows]
