@@ -8,6 +8,10 @@ services:
     volumes:
       - ./config.yml:/app/config.yml
       - ./data:/app/data
-      - ./certs:/app/certs:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"

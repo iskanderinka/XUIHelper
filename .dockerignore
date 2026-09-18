@@ -5,6 +5,9 @@ data/
 *.db-shm
 *.db-wal
 
+# Сертификаты
+certs/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -17,6 +20,9 @@ env/
 .git/
 .gitignore
 
+# Docker
+.dockerignore
+
 # IDE
 .vscode/
 .idea/
@@ -28,6 +34,10 @@ env/
 tests/
 *.md
 
-# Сертификаты
-certs/*
-!certs/.gitkeep
+# Логи
+*.log
+nohup.out
+
+# Переменные окружения
+.env
+.env.*

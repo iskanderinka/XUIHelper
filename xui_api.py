@@ -301,14 +301,6 @@ class XUIApi:
         logger.error(f"Ошибка удаления клиента '{email}': {data}")
         return False
 
-    # ---- Сброс трафика ----
-
-    async def reset_all_client_traffic(self) -> bool:
-        """Сбрасывает трафик всем клиентам всех инбаундов."""
-        if not await self._ensure_session():
-            return False
-        data = await self._request("POST", "/panel/api/inbounds/resetAllClientTraffics/-1")
-        return data is not None and data.get("success", False)
 
     # ---- Получение полного объекта клиента ----
 
@@ -351,20 +343,25 @@ class XUIApi:
 
     # ---- Обновление клиента (enable / expiry / comment) ----
 
-    async def update_client(self, email: str, **changes) -> bool:
+    async def update_client(self, email: str, **changes) -> Optional[bool]:
         """
         Обновляет поля клиента в панели.
+
+        Возвращает:
+          True  — успех
+          False — клиента нет в панели
+          None  — ошибка сессии, сети или API
 
         Собирает payload вручную из известных полей — ровно тех,
         что отправляет UI 3.8.0. Лишние поля из GET (allowedIPs,
         clientStats, up, down и т.п.) не передаём: панель на них падает.
         """
         if not await self._ensure_session():
-            return False
+            return None
 
         client = await self.get_client_object(email)
         if not client:
-            logger.error(f"Клиент '{email}' не найден в панели для обновления.")
+            logger.warning(f"Клиент '{email}' не найден в панели.")
             return False
 
         # id должен быть строкой (UUID). В GET приходит числовой DB-id.
@@ -403,21 +400,27 @@ class XUIApi:
             "trafficResetDay": _to_int(client.get("trafficResetDay"), 1),
         }
 
-        # Применяем изменения
         for key, value in changes.items():
             payload[key] = value
 
         safe_email = url_quote(email, safe="")
-        data = await self._request(
-            "POST",
-            f"/panel/api/clients/update/{safe_email}",
-            json_body=payload,
-        )
+        try:
+            data = await self._request(
+                "POST",
+                f"/panel/api/clients/update/{safe_email}",
+                json_body=payload,
+            )
+        except Exception as e:
+            logger.error(f"Сетевая ошибка обновления '{email}': {e}")
+            return None
+
         if data and data.get("success"):
             logger.info(f"Клиент '{email}' обновлён: {list(changes.keys())}")
             return True
         logger.error(f"Ошибка обновления клиента '{email}': {data}")
-        return False
+        return None
+
+
     # ---- Sub-ссылка ----
 
     def get_client_sub_link(self, sub_id: str) -> Optional[str]:

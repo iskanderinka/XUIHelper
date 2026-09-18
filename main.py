@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid as uuid_module
 import secrets
 import string
@@ -22,7 +23,6 @@ from telegram.ext import (
 )
 import config
 from xui_api import XUIApi
-from query_logic import query_user_data
 from database import (
     init_db, batch_record_traffic, cleanup_old_traffic,
     get_daily_stats, get_panel_daily_stats, get_top_users, has_daily_traffic_snapshot,
@@ -43,9 +43,16 @@ logger = logging.getLogger(__name__)
 
 SCHEDULE_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
 
+# Паттерн допустимых email: только латиница, цифры, точка, дефис, подчёркивание
+EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9._-]{1,64}$')
+
 # Ссылки на активные ConversationHandler — чтобы можно было отменять их программно
 _conv_setting_ref: Optional[ConversationHandler] = None
 _conv_addclient_ref: Optional[ConversationHandler] = None
+
+
+# Защита от двойного /start (специфика iOS после очистки истории)
+_last_start_time: dict = {}  # tg_id -> datetime
 
 
 def _scheduled_time(hour: int, minute: int = 0) -> time:
@@ -79,10 +86,6 @@ def _client_reply_keyboard() -> ReplyKeyboardMarkup:
 # Инициализируем БД при старте
 init_db()
 
-# --- Ограничение частоты запросов (для /mystatus) ---
-failed_query_attempts = {}
-blocked_users = {}
-
 
 # --- Вспомогательные функции ---
 def _format_bytes(size: int) -> str:
@@ -111,6 +114,35 @@ def _get_panel_api(panel_name: str) -> XUIApi:
         sub_url=panel_config.get("sub_url", ""),
     )
 
+def _check_panel_available(panel_name: str) -> Optional[str]:
+    """
+    Проверяет, доступна ли панель для работы.
+
+    Возвращает текст ошибки (str) — если работать нельзя,
+             None — если всё в порядке.
+    """
+    panel_config = config.get_panel_config(panel_name)
+    if not panel_config:
+        return f"❌ Панель '{panel_name}' не найдена в config.yml. Возможно, она была удалена через /delpanel."
+    if panel_config.get("disabled", False):
+        return f"❌ Панель '{panel_name}' отключена. Включи в config.yml или через /setting."
+    return None
+
+def _validate_email(email: str) -> Optional[str]:
+    """
+    Проверяет email на допустимые символы.
+
+    Возвращает текст ошибки или None, если всё в порядке.
+    """
+    if not email:
+        return "❌ Email не может быть пустым."
+    if not EMAIL_PATTERN.match(email):
+        return (
+            "❌ Email может содержать только латинские буквы, цифры, точку, "
+            "дефис и подчёркивание. Длина 1–64 символа. Без пробелов."
+        )
+    return None
+
 def _abort_conversation(update: Update, conv: Optional[ConversationHandler]) -> None:
     """Принудительно завершает ConversationHandler для текущего пользователя."""
     if conv is None:
@@ -120,17 +152,6 @@ def _abort_conversation(update: Update, conv: Optional[ConversationHandler]) -> 
         conv._conversations.pop(key, None)
     except Exception as e:
         logger.warning(f"Не удалось сбросить состояние диалога: {e}")
-
-
-# --- Декораторы ---
-def authorized(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if not config.is_authorized(update.effective_user.id):
-            await update.message.reply_text("Извините, у вас нет прав на использование этого бота.")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
 
 
 def admin_only(func):
@@ -179,6 +200,16 @@ def superadmin_only(func):
 # --- Базовые команды ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+
+    # Защита от двойного /start (Telegram на iOS может прислать /start
+    # автоматически при открытии чата + второй раз от пользователя).
+    now = datetime.now()
+    last = _last_start_time.get(user.id)
+    if last and (now - last).total_seconds() < 2:
+        logger.debug(f"Пропускаю повторный /start от {user.id}")
+        return
+    _last_start_time[user.id] = now
+
     try:
         upsert_bot_user(user.id, user.username or "", user.first_name or "")
     except Exception as e:
@@ -316,9 +347,11 @@ async def inbounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not context.args:
         await update.message.reply_text("Формат: /inbounds <имя панели>")
         return
+
     panel_name = context.args[0]
-    if not config.get_panel_config(panel_name):
-        await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
+    err = _check_panel_available(panel_name)
+    if err:
+        await update.message.reply_text(err)
         return
 
     await update.message.reply_text(f"Загружаю инбаунды панели '{panel_name}'...")
@@ -393,9 +426,16 @@ async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # --- Хелперы для срока подписки ---
 def _days_to_expiry(days: int) -> tuple:
-    """Возвращает (expiry_ts_ms, expiry_date_str) для now + days."""
-    target = datetime.now() + timedelta(days=days)
-    return int(target.timestamp() * 1000), target.strftime("%Y-%m-%d")
+    """
+    Возвращает (expiry_ts_ms, expiry_date_str) для now + days.
+
+    Дата берётся в конце дня (23:59:59) по часовому поясу сервиса —
+    так клиент не теряет часть последнего оплаченного дня.
+    """
+    now = datetime.now(SCHEDULE_TIMEZONE)
+    target_date = (now + timedelta(days=days)).date()
+    target_dt = datetime.combine(target_date, time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE)
+    return int(target_dt.timestamp() * 1000), target_date.strftime("%Y-%m-%d")
 
 
 def _parse_expiry_input(text: str) -> tuple:
@@ -406,6 +446,8 @@ def _parse_expiry_input(text: str) -> tuple:
       - /skip: (0, None, None) — бессрочно
       - дата YYYY-MM-DD: (ts, 'YYYY-MM-DD', None)
       - ошибка: (None, None, 'сообщение')
+
+    Дата трактуется как конец дня (23:59:59) в часовом поясе сервиса.
     """
     text = text.strip().lower()
     if text in ("/skip", "skip", "пропустить"):
@@ -416,7 +458,7 @@ def _parse_expiry_input(text: str) -> tuple:
     except ValueError:
         return None, None, "Не понял формат. Введи дату `ГГГГ-ММ-ДД`, или нажми кнопку, или `/skip`."
 
-    now = datetime.now()
+    now = datetime.now(SCHEDULE_TIMEZONE)
     if parsed.date() < now.date():
         return None, None, "Дата уже прошла. Введи будущую дату."
 
@@ -424,7 +466,8 @@ def _parse_expiry_input(text: str) -> tuple:
     if parsed > max_date:
         return None, None, "Дата слишком далеко (максимум 10 лет вперёд)."
 
-    return int(parsed.timestamp() * 1000), parsed.strftime("%Y-%m-%d"), None
+    target_dt = datetime.combine(parsed.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE)
+    return int(target_dt.timestamp() * 1000), parsed.strftime("%Y-%m-%d"), None
 
 def _find_bindings_for_admin(tg_id: int, email_filter: str = None) -> list:
     """Находит связки клиента, опционально фильтруя по email."""
@@ -432,6 +475,29 @@ def _find_bindings_for_admin(tg_id: int, email_filter: str = None) -> list:
     if email_filter:
         bindings = [b for b in bindings if b["email"] == email_filter]
     return bindings
+
+def _render_binding_line(panel_name: str, email: str, mark: str, extra: str = "") -> str:
+    """Строка отчёта вида: Подписка `user123` — ✅ возобновлена (+30 дн., до 2026-XX-XX)"""
+    base = f"Подписка `{email}` — {mark}"
+    if extra:
+        base += f" {extra}"
+    return base
+
+
+async def _send_client_notice(context: ContextTypes.DEFAULT_TYPE, tg_id: int, text: str) -> None:
+    """Отправляет клиенту уведомление с защитой от ошибок."""
+    try:
+        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить клиента {tg_id}: {e}")
+
+
+async def _edit_query_safely(query, text: str) -> None:
+    """Редактирует сообщение с защитой от «текст не изменился»."""
+    try:
+        await query.edit_message_text(text, parse_mode='Markdown')
+    except Exception as e:
+        logger.debug(f"edit_message_text: {e}")
 
 
 def _days_between(start_str: str, end_str: str) -> int:
@@ -478,12 +544,12 @@ def _parse_extend_argument(text: str) -> tuple:
 
     return "date", parsed.strftime("%Y-%m-%d"), None
 
-def _confirm_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура подтверждения: Да / Нет."""
+def _confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения: Да / Нет. Токен защищает от нажатия на устаревшую кнопку."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Да", callback_data="confirm:yes"),
-            InlineKeyboardButton("❌ Нет", callback_data="confirm:no"),
+            InlineKeyboardButton("✅ Да", callback_data=f"confirm:yes:{token}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"confirm:no:{token}"),
         ]
     ])
 
@@ -498,29 +564,54 @@ async def _ask_confirm(
     """
     Сохраняет pending action и отправляет превью с кнопками Да/Нет.
 
+    Каждому подтверждению присваивается уникальный токен, чтобы нажатие
+    на устаревшее сообщение не выполнило новое действие.
+
     :param action: 'pause' | 'resume' | 'extend' | 'revoke' | 'addclient'
     :param payload: данные, нужные для выполнения действия
     :param preview: текст превью (Markdown)
     """
-    context.user_data['pending'] = {"action": action, "payload": payload}
+    token = secrets.token_hex(4)  # 8 hex-символов
+    context.user_data['pending'] = {
+        "action": action,
+        "payload": payload,
+        "token": token,
+    }
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"⚠️ **Подтверди действие**\n\n{preview}",
         parse_mode='Markdown',
-        reply_markup=_confirm_keyboard(),
+        reply_markup=_confirm_keyboard(token),
     )
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка нажатия Да / Нет."""
+    """Обработка нажатия Да / Нет с проверкой токена."""
     query = update.callback_query
     await query.answer()
 
-    pending = context.user_data.pop('pending', None)
+    # Разбираем callback_data: confirm:yes:token или confirm:no:token
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "confirm":
+        return
+    answer, token = parts[1], parts[2]
+
+    pending = context.user_data.get('pending')
     if not pending:
         await query.edit_message_text("⏱️ Подтверждение устарело. Начни заново.")
         return
 
-    if query.data == "confirm:no":
+    # Сверяем токен — защита от нажатия на старую кнопку
+    if pending.get("token") != token:
+        await query.edit_message_text(
+            "⚠️ Это подтверждение устарело — его перекрыло новое действие.\n"
+            "Посмотри последнее сообщение с кнопками и нажми там."
+        )
+        return
+
+    # Токен совпал — забираем pending
+    context.user_data.pop('pending', None)
+
+    if answer == "no":
         await query.edit_message_text("❌ Действие отменено.")
         return
 
@@ -659,18 +750,31 @@ async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Парсим TG ID
     try:
         tg_id = int(args[0])
+        if tg_id <= 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("TG ID должен быть числом.")
+        await update.message.reply_text("TG ID должен быть положительным числом.")
         return ConversationHandler.END
 
     email = args[1].strip()
     panel_name = args[2].strip()
+
+    err = _validate_email(email)
+    if err:
+        await update.message.reply_text(err)
+        return ConversationHandler.END
 
     # Парсим ID инбаундов
     try:
         inbound_ids = [int(x) for x in args[3:]]
     except ValueError:
         await update.message.reply_text("ID инбаундов должны быть числами.")
+        return ConversationHandler.END
+
+    if len(inbound_ids) > 10:
+        await update.message.reply_text(
+            f"❌ Слишком много инбаундов (максимум 10). У тебя: {len(inbound_ids)}."
+        )
         return ConversationHandler.END
 
     # Проверки
@@ -681,9 +785,20 @@ async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ConversationHandler.END
 
+    err = _check_panel_available(panel_name)
+    if err:
+        await update.message.reply_text(err)
+        return ConversationHandler.END
+
     panel_config = config.get_panel_config(panel_name)
-    if not panel_config:
-        await update.message.reply_text(f"❌ Панель '{panel_name}' не найдена.")
+
+    # Без sub_url клиент не получит ссылку — отказываемся на старте
+    sub_url = (panel_config.get("sub_url") or "").strip()
+    if not sub_url:
+        await update.message.reply_text(
+            f"❌ У панели '{panel_name}' не настроен sub_url.\n\n"
+            f"Настрой его через /setting или в config.yml, потом повтори /addclient."
+        )
         return ConversationHandler.END
 
     if get_binding_by_email(panel_name, email):
@@ -692,12 +807,23 @@ async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ConversationHandler.END
 
-    # Проверка, что инбаунды существуют (через API)
+    # Проверка через API: логин, отсутствие клиента, существование инбаундов
     async with _get_panel_api(panel_name) as api:
         ok = await api.login()
         if not ok:
             await update.message.reply_text("❌ Не удалось подключиться к панели.")
             return ConversationHandler.END
+
+        # Клиент может существовать в панели, даже если его нет в БД
+        # (например, создан вручную через UI). Проверяем оба источника.
+        existing = await api.get_client_object(email)
+        if existing:
+            await update.message.reply_text(
+                f"❌ Клиент с email '{email}' уже существует в панели '{panel_name}'.\n"
+                f"Если это ошибка — удали его через /revoke или в UI панели."
+            )
+            return ConversationHandler.END
+
         available = await api.get_inbounds_list()
 
     available_ids = {ib["id"] for ib in available}
@@ -724,7 +850,7 @@ async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"- Email: `{email}`\n"
         f"- Панель: `{panel_name}`\n"
         f"- Инбаунды: `{inbound_ids}`\n\n"
-        f"Введи лимит HWID (целое число >= 0), или `/skip` для безлимита:",
+        f"Введи лимит HWID (0–10, где 0 = безлимит), или `/skip`:",
         parse_mode='Markdown',
     )
     return AC_HWID
@@ -735,10 +861,12 @@ async def addclient_hwid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
     try:
         hwid = int(text)
-        if hwid < 0:
-            raise ValueError
     except ValueError:
-        await update.message.reply_text("Нужно целое число >= 0, или /skip.")
+        await update.message.reply_text("Нужно целое число от 0 до 10, или /skip.")
+        return AC_HWID
+
+    if hwid < 0 or hwid > 11:
+        await update.message.reply_text("Лимит HWID — от 0 до 10 (0 = безлимит).")
         return AC_HWID
 
     if "ac" not in context.user_data:
@@ -901,10 +1029,16 @@ async def pausesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Не найдено связок для этого клиента.")
         return
 
+    for b in bindings:
+        err = _check_panel_available(b["panel_name"])
+        if err:
+            await update.message.reply_text(err)
+            return
+
     preview_lines = [f"Поставить на паузу клиента `{tg_id}`:\n"]
     for b in bindings:
         status = "уже на паузе" if b.get("paused_at") else "будет приостановлена"
-        preview_lines.append(f"- `{b['panel_name']}/{b['email']}` — {status}")
+        preview_lines.append(f"Подписка `{b['email']}` — {status}")
 
     await _ask_confirm(
         chat_id=update.effective_chat.id,
@@ -928,40 +1062,36 @@ async def _do_pause(update, context, payload, query) -> None:
         email = b["email"]
 
         if b.get("paused_at"):
-            lines.append(f"- `{panel_name}/{email}` — уже на паузе")
+            lines.append(_render_binding_line(panel_name, email, "уже на паузе"))
             continue
 
-        ok = False
+        result = None
         try:
             async with _get_panel_api(panel_name) as api:
                 await api.login()
-                ok = await api.update_client(email, enable=False)
+                result = await api.update_client(email, enable=False)
         except Exception as e:
-            logger.error(f"Ошибка паузы '{panel_name}/{email}': {e}")
+            logger.error(f"[admin={update.effective_user.id}] Ошибка паузы '{panel_name}/{email}': {e}")
 
-        if ok:
+        if result is True:
             set_binding_paused(tg_id, panel_name, email, pause_ts)
-            lines.append(f"- `{panel_name}/{email}` — ✅ приостановлена")
+            lines.append(_render_binding_line(panel_name, email, "✅ приостановлена"))
             any_paused = True
+        elif result is False:
+            lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
-            lines.append(f"- `{panel_name}/{email}` — ❌ не удалось")
+            lines.append(_render_binding_line(panel_name, email, "❌ ошибка связи с панелью"))
 
-    await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
+    await _edit_query_safely(query, "\n".join(lines))
 
     if any_paused:
-        try:
-            await context.bot.send_message(
-                chat_id=tg_id,
-                text=(
-                    "⏸️ **Подписка приостановлена**\n\n"
-                    "Дни приостановки не тратятся. "
-                    "Когда возобновишь — срок продлится автоматически.\n\n"
-                    "Связаться с администратором: 🆘 Нужна помощь"
-                ),
-                parse_mode='Markdown',
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить клиента {tg_id} о паузе: {e}")
+        await _send_client_notice(
+            context, tg_id,
+            "⏸️ **Подписка приостановлена**\n\n"
+            "Дни приостановки не тратятся. "
+            "Когда возобновишь — срок продлится автоматически.\n\n"
+            "Связаться с администратором: 🆘 Нужна помощь"
+        )
 
 # --- /resumesub ---
 @admin_only
@@ -984,12 +1114,18 @@ async def resumesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Не найдено связок для этого клиента.")
         return
 
+    for b in bindings:
+        err = _check_panel_available(b["panel_name"])
+        if err:
+            await update.message.reply_text(err)
+            return
+
     preview_lines = [f"Возобновить подписку клиента `{tg_id}`:\n"]
     for b in bindings:
         if b.get("paused_at"):
-            preview_lines.append(f"- `{b['panel_name']}/{b['email']}` — будет возобновлена")
+            preview_lines.append(f"Подписка `{b['email']}` — будет возобновлена")
         else:
-            preview_lines.append(f"- `{b['panel_name']}/{b['email']}` — не на паузе")
+            preview_lines.append(f"Подписка `{b['email']}` — не на паузе")
 
     await _ask_confirm(
         chat_id=update.effective_chat.id,
@@ -1015,55 +1151,61 @@ async def _do_resume(update, context, payload, query) -> None:
         paused_at = b.get("paused_at")
 
         if not paused_at:
-            lines.append(f"- `{panel_name}/{email}` — не на паузе")
+            lines.append(_render_binding_line(panel_name, email, "не на паузе"))
             continue
 
         pause_days = _days_between(paused_at.split()[0], today_str)
 
         old_expiry = b.get("expiry_date")
+
+        # Бессрочная подписка: срок не трогаем — пауза на него не влияет
         if old_expiry:
             try:
                 old_dt = datetime.strptime(old_expiry, "%Y-%m-%d")
             except ValueError:
                 old_dt = now
+            new_dt = old_dt + timedelta(days=pause_days)
+            new_expiry_str = new_dt.strftime("%Y-%m-%d")
+            new_expiry_dt = datetime.combine(
+                new_dt.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE
+            )
+            new_expiry_ts = int(new_expiry_dt.timestamp() * 1000)
+            update_kwargs = {"enable": True, "expiryTime": new_expiry_ts}
+            line_extra = f"(+{pause_days} дн., до {new_expiry_str})"
+            resumed_status = "✅ возобновлена"
         else:
-            old_dt = now
-        new_dt = old_dt + timedelta(days=pause_days)
-        new_expiry_str = new_dt.strftime("%Y-%m-%d")
-        new_expiry_ts = int(new_dt.timestamp() * 1000)
+            # Бессрочная — срок не меняем
+            update_kwargs = {"enable": True}
+            new_expiry_str = None
+            line_extra = "(бессрочная, срок не изменён)"
+            resumed_status = "✅ возобновлена"
 
+        result = None
         try:
             async with _get_panel_api(panel_name) as api:
                 await api.login()
-                ok = await api.update_client(
-                    email, enable=True, expiryTime=new_expiry_ts,
-                )
+                result = await api.update_client(email, **update_kwargs)
         except Exception as e:
-            logger.error(f"Ошибка снятия с паузы '{panel_name}/{email}': {e}")
-            ok = False
+            logger.error(f"[admin={update.effective_user.id}] Ошибка снятия с паузы '{panel_name}/{email}': {e}")
 
-        if ok:
+        if result is True:
             set_binding_paused(tg_id, panel_name, email, None)
-            update_binding_expiry(tg_id, panel_name, email, new_expiry_str)
-            lines.append(
-                f"- `{panel_name}/{email}` — ✅ возобновлена "
-                f"(+{pause_days} дн., до {new_expiry_str})"
-            )
+            if new_expiry_str:
+                update_binding_expiry(tg_id, panel_name, email, new_expiry_str)
+            lines.append(_render_binding_line(panel_name, email, resumed_status, line_extra))
             resumed = True
+        elif result is False:
+            lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
-            lines.append(f"- `{panel_name}/{email}` — ❌ не удалось")
+            lines.append(_render_binding_line(panel_name, email, "❌ ошибка связи с панелью"))
 
-    await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
+    await _edit_query_safely(query, "\n".join(lines))
 
     if resumed:
-        try:
-            await context.bot.send_message(
-                chat_id=tg_id,
-                text="▶️ **Подписка возобновлена.** Срок продлён на дни приостановки.",
-                parse_mode='Markdown',
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить клиента {tg_id} о возобновлении: {e}")
+        await _send_client_notice(
+            context, tg_id,
+            "▶️ **Подписка возобновлена.** Срок продлён на дни приостановки."
+        )
 
 
 # --- /extendsub ---
@@ -1099,6 +1241,12 @@ async def extendsub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Не найдено связок для этого клиента.")
         return
 
+    for b in bindings:
+        err = _check_panel_available(b["panel_name"])
+        if err:
+            await update.message.reply_text(err)
+            return
+
     preview_lines = [f"Продлить подписку клиента `{tg_id}`:\n"]
     if kind == "days":
         preview_lines.append(f"Аргумент: **+{value} дней**\n")
@@ -1106,7 +1254,7 @@ async def extendsub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         preview_lines.append(f"Аргумент: **до {value}**\n")
     for b in bindings:
         old = b.get("expiry_date") or "бессрочно"
-        preview_lines.append(f"- `{b['panel_name']}/{b['email']}` (сейчас: {old})")
+        preview_lines.append(f"Подписка `{b['email']}` (сейчас: {old})")
 
     await _ask_confirm(
         chat_id=update.effective_chat.id,
@@ -1149,24 +1297,30 @@ async def _do_extend(update, context, payload, query) -> None:
             result_str = f"до {value}"
 
         new_expiry_str = new_dt.strftime("%Y-%m-%d")
-        new_expiry_ts = int(new_dt.timestamp() * 1000)
+        new_expiry_dt = datetime.combine(
+            new_dt.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE
+        )
+        new_expiry_ts = int(new_expiry_dt.timestamp() * 1000)
 
+        result = None
         try:
             async with _get_panel_api(panel_name) as api:
                 await api.login()
-                ok = await api.update_client(email, expiryTime=new_expiry_ts)
+                result = await api.update_client(email, expiryTime=new_expiry_ts)
         except Exception as e:
-            logger.error(f"Ошибка продления '{panel_name}/{email}': {e}")
-            ok = False
+            logger.error(f"[admin={update.effective_user.id}] Ошибка продления '{panel_name}/{email}': {e}")
 
-        if ok:
+        if result is True:
             update_binding_expiry(tg_id, panel_name, email, new_expiry_str)
-            lines.append(
-                f"- `{panel_name}/{email}` — ✅ {result_str}, до {new_expiry_str}"
-            )
+            lines.append(_render_binding_line(
+                panel_name, email, f"✅ {result_str}",
+                f"до {new_expiry_str}"
+            ))
             last_new_expiry_str = new_expiry_str
+        elif result is False:
+            lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
-            lines.append(f"- `{panel_name}/{email}` — ❌ не удалось")
+            lines.append(_render_binding_line(panel_name, email, "❌ ошибка связи с панелью"))
 
     await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
 
@@ -1201,9 +1355,15 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Не найдено связок для удаления.")
         return
 
+    for b in bindings:
+        err = _check_panel_available(b["panel_name"])
+        if err:
+            await update.message.reply_text(err)
+            return
+
     preview_lines = [f"**Удалить клиента** `{tg_id}`:\n"]
     for b in bindings:
-        preview_lines.append(f"- `{b['panel_name']}/{b['email']}`")
+        preview_lines.append(f"Подписка `{b['email']}`")
     preview_lines.append("\n⚠️ Клиент будет **удалён из панели** и БД.")
 
     await _ask_confirm(
@@ -1231,7 +1391,8 @@ async def _do_revoke(update, context, payload, query) -> None:
                 await api.login()
                 panel_ok = await api.delete_client(email)
         except Exception as e:
-            logger.error(f"Ошибка удаления из панели '{panel_name}/{email}': {e}")
+            logger.error(
+                f"[admin={update.effective_user.id}] Ошибка удаления из панели '{panel_name}/{email}': {e}")
 
         db_ok = delete_binding(tg_id, panel_name, email)
 
@@ -1239,8 +1400,7 @@ async def _do_revoke(update, context, payload, query) -> None:
         mark_db = "✅" if db_ok else "❌"
         lines.append(f"- `{panel_name}/{email}` — панель: {mark_panel}, БД: {mark_db}")
 
-    await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
-
+    await _edit_query_safely(query, "\n".join(lines))
 
 # --- /getlink ---
 @admin_only
@@ -1263,21 +1423,41 @@ async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Не найдено связок для этого клиента.")
         return
 
+    for b in bindings:
+        err = _check_panel_available(b["panel_name"])
+        if err:
+            await update.message.reply_text(err)
+            return
+
     lines = [f"🔗 **Ссылки клиента** `{tg_id}`:\n"]
     for b in bindings:
-        panel_config = config.get_panel_config(b["panel_name"])
+        panel_name = b["panel_name"]
+        email = b["email"]
+        panel_config = config.get_panel_config(panel_name)
         sub_url = panel_config.get("sub_url", "").rstrip("/")
         status = "⏸️ приостановлена" if b.get("paused_at") else "▶️ активна"
 
+        # Проверяем клиента в панели: если его там нет — предупреждаем админа
+        warn_line = ""
+        try:
+            async with _get_panel_api(panel_name) as api:
+                ok = await api.login()
+                if ok:
+                    client = await api.get_client_object(email)
+                    if client is None:
+                        warn_line = "\n⚠️ клиента нет в панели — ссылка не работает"
+                else:
+                    warn_line = "\n⚠️ не удалось подключиться к панели"
+        except Exception as e:
+            logger.warning(f"Проверка клиента '{panel_name}/{email}': {e}")
+            warn_line = "\n⚠️ не удалось подключиться к панели"
+
         if sub_url:
             link = f"{sub_url}/{b['sub_id']}"
-            lines.append(
-                f"**{b['panel_name']}** ({b['email']}) — {status}:\n{link}\n"
-            )
+            lines.append(f"**{panel_name}** ({email}) — {status}:\n{link}{warn_line}\n")
         else:
             lines.append(
-                f"**{b['panel_name']}** ({b['email']}) — {status}: "
-                f"sub_url не настроен\n"
+                f"**{panel_name}** ({email}) — {status}: sub_url не настроен\n"
             )
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
@@ -1300,6 +1480,7 @@ async def _do_addclient(update, context, payload, query) -> None:
         ok = await api.login()
         if not ok:
             await query.edit_message_text("❌ Не удалось подключиться к панели.")
+            logger.error(f"[admin={update.effective_user.id}] Не удалось залогиниться в панель '{panel_name}'")
             return
 
         created = await api.create_client(
@@ -1316,6 +1497,15 @@ async def _do_addclient(update, context, payload, query) -> None:
 
     if not created:
         await query.edit_message_text("❌ Не удалось создать клиента. Проверь логи бота.")
+        logger.error(f"[admin={update.effective_user.id}] Не удалось создать клиента '{email}' на '{panel_name}'")
+        return
+
+    # Подстраховка: sub_url мог быть снят между шагами диалога
+    if not sub_link:
+        await query.edit_message_text(
+            "⚠️ Клиент создан в панели, но sub_url у панели не настроен.\n"
+            "Настрой sub_url через /setting и выдай ссылку клиенту вручную через /getlink."
+        )
         return
 
     # Сохранение в БД
@@ -1399,7 +1589,16 @@ def _format_client_binding(b: dict) -> str:
     hwid_str = "безлимит" if hwid == 0 else str(hwid)
 
     expiry = b.get("expiry_date") or "бессрочно"
-    status = "⏸️ приостановлена" if b.get("paused_at") else "▶️ активна"
+
+    panel_config = config.get_panel_config(panel_name)
+    panel_available = bool(panel_config) and not panel_config.get("disabled", False)
+
+    if not panel_available:
+        status_icon = "🚫"
+    elif b.get("paused_at"):
+        status_icon = "⏸️"
+    else:
+        status_icon = "▶️"
 
     lines = [
         user_line,
@@ -1407,10 +1606,10 @@ def _format_client_binding(b: dict) -> str:
         f"🎛️ `{panel_name}`",
         f"🆔 `{tg_id}`",
         f"📳 HWID `{hwid_str}`",
-        f"🗓️ до `{expiry}` · {status}",
+        f"{status_icon} до `{expiry}`",
     ]
     if b.get("comment"):
-        lines.append(f"💬 {b['comment']}")
+        lines.append(f"💬 _{b['comment']}_")
     return "\n".join(lines)
 
 
@@ -1445,9 +1644,9 @@ def _render_clients_page(bindings: list, page: int) -> tuple:
 
     lines = [f"👥 **Список клиентов** (страница {page + 1}/{total_pages}):\n"]
     for i, b in enumerate(chunk):
-        lines.append("───────────────")
+        lines.append("============================")
         lines.append(_format_client_binding(b))
-    lines.append("───────────────")
+    lines.append("============================")
 
     return "\n".join(lines), _clients_keyboard(page, total_pages)
 
@@ -1920,11 +2119,6 @@ async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
         if b.get("paused_at"):
             continue
 
-    for b in bindings:
-        expiry_str = b.get("expiry_date")
-        if not expiry_str:
-            continue  # бессрочно
-
         try:
             expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
         except ValueError:
@@ -1975,9 +2169,10 @@ async def post_init(application: Application) -> None:
     """
     Глобальное меню команд.
 
-    Показываем только общие команды:
-      - mylink / mystatus не в меню — они в reply-клавиатуре клиента.
-      - админские команды тоже не в меню — админ видит их в /help.
+    Показываем только базовые команды:
+      - /start, /help, /policy.
+      - клиентские ссылки и тарифы — в reply-клавиатуре.
+      - админские команды — только в /help (не в меню).
     """
     commands = [
         BotCommand("start", "🚀 Начать работу с ботом"),
@@ -2050,7 +2245,7 @@ def main() -> None:
     _conv_addclient_ref = conv_addclient
 
     # Callback-подтверждения — регистрируем ДО ConversationHandler
-    application.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:(yes|no)$"))
+    application.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
 
     application.add_handler(conv_setting)

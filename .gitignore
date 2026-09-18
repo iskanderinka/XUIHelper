@@ -27,9 +27,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# Логи
+# Логи и фоновые артефакты
 *.log
+nohup.out
 
 # Сертификаты
-certs/*
-!certs/.gitkeep
+certs/
+
+# Переменные окружения
+.env
+.env.*

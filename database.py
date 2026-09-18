@@ -10,13 +10,14 @@ logger = logging.getLogger(__name__)
 DB_DIR = os.environ.get("DB_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 DB_PATH = os.path.join(DB_DIR, "traffic.db")
 
-
 def _get_conn() -> sqlite3.Connection:
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Принудительный checkpoint WAL каждые 1000 страниц (~4 МБ)
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     return conn
 
 
@@ -210,32 +211,6 @@ def get_panel_daily_stats(start_date: str, end_date: str) -> List[Dict]:
              "daily_total": r["daily_total"] or 0} for r in rows]
 
 
-def get_user_daily_stats(start_date: str, end_date: str,
-                          panel_name: str, email: Optional[str] = None,
-                          limit: int = 100) -> List[Dict]:
-    conn = _get_conn()
-    params: list = [start_date, end_date, panel_name]
-    where = ["deltas.record_date >= ?", "deltas.record_date <= ?", "deltas.panel_name = ?"]
-    if email:
-        where.append("deltas.email = ?")
-        params.append(email)
-    sql = _delta_cte() + f"""
-        SELECT record_date, email,
-               SUM(delta_up + delta_down) AS daily_total
-        FROM deltas
-        WHERE {' AND '.join(where)}
-        GROUP BY record_date, email
-        ORDER BY record_date, daily_total DESC
-        LIMIT ?
-    """
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [{"record_date": r["record_date"],
-             "email": r["email"],
-             "daily_total": r["daily_total"] or 0} for r in rows]
-
-
 def get_top_users(start_date: str, end_date: str,
                   panel_name: Optional[str] = None, limit: int = 20) -> List[Dict]:
     conn = _get_conn()
@@ -261,48 +236,6 @@ def get_top_users(start_date: str, end_date: str,
              "total_usage": r["total_usage"] or 0} for r in rows]
 
 
-def get_latest_snapshot(panel_name: Optional[str] = None) -> List[Dict]:
-    conn = _get_conn()
-    if panel_name:
-        sql = """
-            SELECT t.* FROM traffic_records t
-            INNER JOIN (
-                SELECT panel_name, email, MAX(record_date) AS maxd
-                FROM traffic_records GROUP BY panel_name, email
-            ) m ON t.panel_name = m.panel_name
-               AND t.email = m.email
-               AND t.record_date = m.maxd
-            WHERE t.panel_name = ?
-            ORDER BY (t.upload + t.download) DESC
-        """
-        rows = conn.execute(sql, (panel_name,)).fetchall()
-    else:
-        sql = """
-            SELECT t.* FROM traffic_records t
-            INNER JOIN (
-                SELECT panel_name, email, MAX(record_date) AS maxd
-                FROM traffic_records GROUP BY panel_name, email
-            ) m ON t.panel_name = m.panel_name
-               AND t.email = m.email
-               AND t.record_date = m.maxd
-            ORDER BY t.panel_name, (t.upload + t.download) DESC
-        """
-        rows = conn.execute(sql).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def get_date_range() -> Optional[Tuple[str, str]]:
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT MIN(record_date) AS mind, MAX(record_date) AS maxd FROM traffic_records"
-    ).fetchone()
-    conn.close()
-    if row and row["mind"]:
-        return row["mind"], row["maxd"]
-    return None
-
-
 def has_daily_traffic_snapshot(record_date: str) -> bool:
     """Проверяет, есть ли за дату снимок, сделанный по расписанию (после 23:00)."""
     conn = _get_conn()
@@ -314,28 +247,6 @@ def has_daily_traffic_snapshot(record_date: str) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
-
-
-def get_panel_user_list(panel_name: str) -> List[str]:
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT email FROM traffic_records WHERE panel_name = ? ORDER BY email",
-        (panel_name,),
-    ).fetchall()
-    conn.close()
-    return [r["email"] for r in rows]
-
-
-def get_panel_summary_for_date(panel_name: str, record_date: str) -> List[Dict]:
-    conn = _get_conn()
-    rows = conn.execute(
-        """SELECT * FROM traffic_records
-           WHERE panel_name = ? AND record_date = ?
-           ORDER BY (upload + download) DESC""",
-        (panel_name, record_date),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 
 # ---------- bot_users: кто запускал бота ----------
@@ -363,26 +274,6 @@ def is_bot_user(tg_id: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
-
-
-def get_bot_user(tg_id: int) -> Optional[Dict]:
-    """Возвращает запись о пользователе бота."""
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT * FROM bot_users WHERE tg_id = ?", (int(tg_id),)
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def list_bot_users() -> List[Dict]:
-    """Список всех, кто когда-либо запускал бота."""
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM bot_users ORDER BY first_seen DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 
 # ---------- client_bindings: связки клиентов ----------
@@ -545,17 +436,6 @@ def update_binding_expiry(tg_id: int, panel_name: str, email: str,
     conn.close()
 
 
-def update_binding_comment(tg_id: int, panel_name: str, email: str,
-                           comment: str) -> None:
-    """Обновляет комментарий в связке."""
-    conn = _get_conn()
-    conn.execute(
-        """UPDATE client_bindings SET comment = ?
-           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
-        (comment, int(tg_id), panel_name, email),
-    )
-    conn.commit()
-    conn.close()
 
 def list_all_bindings_with_users() -> List[Dict]:
     """Как list_all_bindings, но подтягивает username и first_name из bot_users."""
