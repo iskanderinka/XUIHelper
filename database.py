@@ -54,16 +54,43 @@ def init_db():
             sub_id       TEXT    NOT NULL,
             uuid         TEXT    NOT NULL,
             limit_hwid   INTEGER DEFAULT 0,
+            expiry_date  TEXT,
+            paused_at    TEXT,
+            comment      TEXT,
             created_at   TEXT    DEFAULT (datetime('now','localtime')),
             PRIMARY KEY (tg_id, panel_name, email)
         );
         CREATE INDEX IF NOT EXISTS idx_cb_tg    ON client_bindings(tg_id);
         CREATE INDEX IF NOT EXISTS idx_cb_email ON client_bindings(panel_name, email);
+
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id       INTEGER NOT NULL,
+            panel_name  TEXT    NOT NULL,
+            email       TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,
+            expiry_date TEXT    NOT NULL,
+            sent_at     TEXT    DEFAULT (datetime('now','localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_nl_key
+            ON notification_log(tg_id, panel_name, email, kind);
     """)
+
+    # Миграции для баз, созданных до этого обновления
+    cols = [row["name"] for row in conn.execute("PRAGMA table_info(client_bindings)").fetchall()]
+    if "expiry_date" not in cols:
+        conn.execute("ALTER TABLE client_bindings ADD COLUMN expiry_date TEXT")
+        logger.info("Миграция: добавлена колонка expiry_date")
+    if "paused_at" not in cols:
+        conn.execute("ALTER TABLE client_bindings ADD COLUMN paused_at TEXT")
+        logger.info("Миграция: добавлена колонка paused_at")
+    if "comment" not in cols:
+        conn.execute("ALTER TABLE client_bindings ADD COLUMN comment TEXT")
+        logger.info("Миграция: добавлена колонка comment")
+
     conn.commit()
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
-
 
 # ---------- Снимки трафика ----------
 
@@ -359,7 +386,6 @@ def list_bot_users() -> List[Dict]:
 
 
 # ---------- client_bindings: связки клиентов ----------
-
 def save_binding(
     tg_id: int,
     panel_name: str,
@@ -368,24 +394,28 @@ def save_binding(
     sub_id: str,
     uuid: str,
     limit_hwid: int = 0,
+    expiry_date: str = None,
+    comment: str = None,
 ) -> None:
     """Сохраняет или обновляет связку клиента."""
     conn = _get_conn()
     conn.execute(
         """INSERT INTO client_bindings
-               (tg_id, panel_name, email, inbound_ids, sub_id, uuid, limit_hwid)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+               (tg_id, panel_name, email, inbound_ids, sub_id, uuid,
+                limit_hwid, expiry_date, comment)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(tg_id, panel_name, email) DO UPDATE SET
                inbound_ids = excluded.inbound_ids,
                sub_id      = excluded.sub_id,
                uuid        = excluded.uuid,
-               limit_hwid  = excluded.limit_hwid""",
+               limit_hwid  = excluded.limit_hwid,
+               expiry_date = excluded.expiry_date,
+               comment     = excluded.comment""",
         (int(tg_id), panel_name, email, json.dumps(inbound_ids),
-         sub_id, uuid, int(limit_hwid)),
+         sub_id, uuid, int(limit_hwid), expiry_date, comment),
     )
     conn.commit()
     conn.close()
-
 
 def _parse_binding_row(row) -> Dict:
     """Преобразует строку из БД в словарь с распарсенным inbound_ids."""
@@ -440,3 +470,89 @@ def list_all_bindings() -> List[Dict]:
     ).fetchall()
     conn.close()
     return [_parse_binding_row(r) for r in rows]
+
+# ---------- Лог уведомлений о сроке подписки ----------
+
+def has_recent_notification(
+    tg_id: int,
+    panel_name: str,
+    email: str,
+    kind: str,
+    expiry_date: str,
+    within_hours: int = 20,
+) -> bool:
+    """
+    Проверяет, отправляли ли это уведомление в последние within_hours часов.
+
+    Учитывает expiry_date — если админ продлит подписку, старые записи
+    не помешают новым напоминаниям.
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        """SELECT 1 FROM notification_log
+           WHERE tg_id = ? AND panel_name = ? AND email = ?
+             AND kind = ? AND expiry_date = ?
+             AND sent_at >= datetime('now', 'localtime', ?)
+           LIMIT 1""",
+        (int(tg_id), panel_name, email, kind, expiry_date, f'-{within_hours} hours'),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def log_notification(
+    tg_id: int,
+    panel_name: str,
+    email: str,
+    kind: str,
+    expiry_date: str,
+) -> None:
+    """Записывает факт отправки уведомления."""
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO notification_log
+               (tg_id, panel_name, email, kind, expiry_date)
+           VALUES (?, ?, ?, ?, ?)""",
+        (int(tg_id), panel_name, email, kind, expiry_date),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_binding_paused(tg_id: int, panel_name: str, email: str,
+                       paused_at: str = None) -> None:
+    """Устанавливает/снимает метку паузы."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET paused_at = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (paused_at, int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_binding_expiry(tg_id: int, panel_name: str, email: str,
+                          new_expiry_date: str) -> None:
+    """Обновляет срок действия в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET expiry_date = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (new_expiry_date, int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_binding_comment(tg_id: int, panel_name: str, email: str,
+                           comment: str) -> None:
+    """Обновляет комментарий в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET comment = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (comment, int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()

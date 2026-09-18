@@ -2,6 +2,7 @@ import httpx
 import logging
 import re
 import ssl
+import json
 import uuid as uuid_module
 from typing import Dict, Any, Optional, List
 from urllib.parse import quote as url_quote, urlparse
@@ -233,7 +234,6 @@ class XUIApi:
         return clients
 
     # ---- Создание клиента ----
-
     async def create_client(
         self,
         email: str,
@@ -244,6 +244,7 @@ class XUIApi:
         tg_id: int = 0,
         total_gb: int = 0,
         expiry_time: int = 0,
+        comment: str = "",
     ) -> bool:
         """Создаёт клиента и привязывает к указанным инбаундам."""
         if not await self._ensure_session():
@@ -268,7 +269,7 @@ class XUIApi:
                 "expiryTime": expiry_time,
                 "enable": True,
                 "tgId": tg_id,
-                "comment": "",
+                "comment": comment or "",
                 "group": "",
                 "reset": 0,
                 "resetDay": 0,
@@ -309,6 +310,114 @@ class XUIApi:
         data = await self._request("POST", "/panel/api/inbounds/resetAllClientTraffics/-1")
         return data is not None and data.get("success", False)
 
+    # ---- Получение полного объекта клиента ----
+
+    async def get_client_object(self, email: str) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает полный объект клиента из панели.
+
+        Пробует несколько эндпоинтов 3.8.x. Если ни один не сработал —
+        ищет клиента в inbounds list.
+        """
+        if not await self._ensure_session():
+            return None
+
+        safe_email = url_quote(email, safe="")
+
+        # Основной вариант: /panel/api/clients/get/<email>
+        data = await self._request("GET", f"/panel/api/clients/get/{safe_email}")
+        if data and data.get("success") and data.get("obj"):
+            obj = data["obj"]
+            # Некоторые версии оборачивают: {"obj": {"client": {...}, "inboundIds": [...]}}
+            if isinstance(obj, dict) and "client" in obj:
+                return obj["client"]
+            return obj
+
+        # Fallback: ищем клиента в inbounds list
+        inbounds_data = await self.get_inbounds()
+        if inbounds_data and inbounds_data.get("success"):
+            for inbound in inbounds_data.get("obj", []) or []:
+                settings_raw = inbound.get("settings", "")
+                if not settings_raw:
+                    continue
+                try:
+                    settings = json.loads(settings_raw)
+                except (ValueError, TypeError):
+                    continue
+                for client in settings.get("clients", []) or []:
+                    if client.get("email") == email:
+                        return client
+        return None
+
+    # ---- Обновление клиента (enable / expiry / comment) ----
+
+    async def update_client(self, email: str, **changes) -> bool:
+        """
+        Обновляет поля клиента в панели.
+
+        Собирает payload вручную из известных полей — ровно тех,
+        что отправляет UI 3.8.0. Лишние поля из GET (allowedIPs,
+        clientStats, up, down и т.п.) не передаём: панель на них падает.
+        """
+        if not await self._ensure_session():
+            return False
+
+        client = await self.get_client_object(email)
+        if not client:
+            logger.error(f"Клиент '{email}' не найден в панели для обновления.")
+            return False
+
+        # id должен быть строкой (UUID). В GET приходит числовой DB-id.
+        uuid_value = client.get("uuid") or ""
+        if not isinstance(uuid_value, str):
+            uuid_value = str(uuid_value)
+        client_id = uuid_value or str(client.get("id", "") or "")
+
+        def _to_int(v, default=0):
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return default
+
+        payload = {
+            "email": client.get("email") or email,
+            "uuid": uuid_value,
+            "id": client_id,
+            "subId": client.get("subId") or "",
+            "password": client.get("password") or "",
+            "auth": client.get("auth") or "",
+            "flow": client.get("flow") or "",
+            "security": client.get("security") or "auto",
+            "limitIp": _to_int(client.get("limitIp"), 0),
+            "limitHwid": _to_int(client.get("limitHwid"), 0),
+            "totalGB": _to_int(client.get("totalGB"), 0),
+            "expiryTime": _to_int(client.get("expiryTime"), 0),
+            "enable": bool(client.get("enable", True)),
+            "tgId": _to_int(client.get("tgId"), 0),
+            "comment": client.get("comment") or "",
+            "group": client.get("group") or "",
+            "reset": _to_int(client.get("reset"), 0),
+            "resetDay": _to_int(client.get("resetDay"), 0),
+            "resetMax": _to_int(client.get("resetMax"), 0),
+            "trafficReset": client.get("trafficReset") or "never",
+            "trafficResetDay": _to_int(client.get("trafficResetDay"), 1),
+        }
+
+        # Применяем изменения
+        for key, value in changes.items():
+            payload[key] = value
+
+        safe_email = url_quote(email, safe="")
+        data = await self._request(
+            "POST",
+            f"/panel/api/clients/update/{safe_email}",
+            json_body=payload,
+        )
+        if data and data.get("success"):
+            logger.info(f"Клиент '{email}' обновлён: {list(changes.keys())}")
+            return True
+        logger.error(f"Ошибка обновления клиента '{email}': {data}")
+        return False
     # ---- Sub-ссылка ----
 
     def get_client_sub_link(self, sub_id: str) -> Optional[str]:

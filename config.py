@@ -106,53 +106,8 @@ def get_admin_users() -> List[int]:
             continue
     return result
 
-
-def get_normal_users() -> List[int]:
-    users = config.get("users", {}).get("normal_users") or []
-    if not isinstance(users, list):
-        users = [users] if users else []
-    result = []
-    for u in users:
-        try:
-            result.append(int(u))
-        except (ValueError, TypeError):
-            continue
-    return result
-
-
 def is_admin(user_id: int) -> bool:
     return user_id in get_admin_users()
-
-
-def is_authorized(user_id: int) -> bool:
-    return is_admin(user_id) or user_id in get_normal_users()
-
-
-# ---------- Управление пользователями ----------
-
-def add_normal_user(user_id: int) -> bool:
-    """Добавляет ID в список обычных пользователей. False, если уже есть."""
-    user_id = int(user_id)
-    current = get_config()
-    current.setdefault("users", {}).setdefault("normal_users", [])
-    if user_id in current["users"]["normal_users"]:
-        return False
-    current["users"]["normal_users"].append(user_id)
-    save_config(current)
-    return True
-
-
-def del_normal_user(user_id: int) -> bool:
-    """Удаляет ID из списка обычных пользователей. False, если не было."""
-    user_id = int(user_id)
-    current = get_config()
-    users = current.get("users", {})
-    if user_id not in users.get("normal_users", []):
-        return False
-    users["normal_users"].remove(user_id)
-    save_config(current)
-    return True
-
 
 # ---------- Панели ----------
 
@@ -260,3 +215,44 @@ def get_accounting_mode() -> str:
     if mode not in ("unidirectional", "bidirectional"):
         return "unidirectional"
     return mode
+
+
+# ---------- Политика конфиденциальности ----------
+DEFAULT_POLICY_MESSAGE = (
+    "🔒 **Политика конфиденциальности**\n\n"
+    "Мы собираем минимально необходимые данные для предоставления услуг:\n\n"
+    "• Telegram ID и имя пользователя\n"
+    "• Даты подписки\n"
+    "• История обращений\n\n"
+    "Данные используются только для работы сервиса и не передаются третьим лицам."
+)
+
+
+def get_policy_url() -> str:
+    """URL страницы политики. Пусто, если не задан в config.yml."""
+    return (config.get("policy", {}).get("url") or "").strip()
+
+
+def get_policy_message() -> str:
+    """Краткий текст перед кнопкой. Если не задан — стандартный."""
+    message = (config.get("policy", {}).get("message") or "").strip()
+    return message if message else DEFAULT_POLICY_MESSAGE
+
+
+# ---------- Тарифы ----------
+
+DEFAULT_TARIFFS_MESSAGE = (
+    "📊 **Наши тарифы**\n\n"
+    "Актуальные тарифы и цены — по кнопке ниже."
+)
+
+
+def get_tariffs_url() -> str:
+    """URL страницы с тарифами. Пусто, если не задан в config.yml."""
+    return (config.get("tariffs", {}).get("url") or "").strip()
+
+
+def get_tariffs_message() -> str:
+    """Текст перед кнопкой тарифов. Если не задан — стандартный."""
+    msg = (config.get("tariffs", {}).get("message") or "").strip()
+    return msg if msg else DEFAULT_TARIFFS_MESSAGE
