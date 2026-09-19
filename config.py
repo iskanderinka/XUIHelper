@@ -2,6 +2,8 @@
 import yaml
 import os
 from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 
 CONFIG_FILE = "config.yml"
 DEFAULT_CONFIG = {
@@ -12,9 +14,6 @@ DEFAULT_CONFIG = {
     },
     "panels": {}
 }
-
-from urllib.parse import urlparse
-
 
 def _validate_panel_url(url: str) -> tuple:
     """
@@ -250,3 +249,19 @@ def is_superadmin(user_id: int) -> bool:
 def has_superadmin() -> bool:
     """Есть ли вообще суперадмин в конфиге."""
     return get_superadmin_id() is not None
+
+
+# ---------- Часовой пояс ----------
+
+def get_timezone() -> str:
+    """
+    Часовой пояс из config.yml.
+
+    Если не указан или содержит опечатку — возвращает Asia/Hong_Kong.
+    """
+    tz = (config.get("timezone") or "Asia/Hong_Kong").strip()
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        return "Asia/Hong_Kong"
+    return tz

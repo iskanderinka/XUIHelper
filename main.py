@@ -1,16 +1,12 @@
 import logging
-import re
 import uuid as uuid_module
-import secrets
-import string
 from functools import wraps
 from datetime import datetime, timedelta, time
 from typing import Optional
-from zoneinfo import ZoneInfo
+
 from telegram import (
     Update, BotCommand,
     InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -21,16 +17,28 @@ from telegram.ext import (
     filters,
     ConversationHandler,
 )
+
 import config
-from xui_api import XUIApi
 from database import (
-    init_db, batch_record_traffic, cleanup_old_traffic,
-    get_daily_stats, get_panel_daily_stats, get_top_users, has_daily_traffic_snapshot,
-    upsert_bot_user, is_bot_user,
+    init_db, upsert_bot_user, is_bot_user,
     save_binding, get_user_bindings, get_binding_by_email,
-    delete_binding, list_all_bindings, list_all_bindings_with_users,
-    has_recent_notification, log_notification,
+    delete_binding, list_all_bindings_with_users,
     set_binding_paused, update_binding_expiry,
+)
+from helpers import (
+    _tz,
+    _format_bytes, _make_sub_id,
+    _validate_email,
+    _get_panel_api, _check_panel_available,
+    _find_bindings_for_admin,
+    _days_to_expiry, _parse_expiry_input, _days_between, _parse_extend_argument,
+    _client_reply_keyboard, _ask_confirm,
+    _render_binding_line, _send_client_notice, _edit_query_safely,
+)
+from jobs import (
+    record_traffic_job, daily_report_job,
+    check_inbounds_job, expiry_notification_job,
+    _generate_daily_report_text,
 )
 
 logging.basicConfig(
@@ -41,10 +49,30 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("xui_api").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-SCHEDULE_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
+# =============================================================================
+# main.py — точка входа и хендлеры бота
+# =============================================================================
+#
+# СТРУКТУРА ФАЙЛА (поиск по метке в редакторе):
+#
+#   [1] Импорты и настройки (вверху)
+#   [2] Глобальные переменные и абстракции диалогов
+#   [3] Декораторы @admin_only, @superadmin_only
+#   [4] Базовые команды: /start, /help, /policy
+#   [5] Админ-команды панелей: /status, /inbounds, /listpanels, /delpanel
+#   [6] Диалог /addclient: addclient_start … addclient_cancel
+#   [7] Команды подписок: /pausesub, /resumesub, /extendsub, /revoke, /getlink
+#   [8] Клиентские команды: /mylink и reply-кнопки
+#   [9] Диалог /setting: setting_start … cancel_setting
+#   [10] Обработчики callback: confirm_callback, clients_nav_callback
+#   [11] Вспомогательные UI: _expiry_keyboard, _render_clients_page
+#   [12] Обработчик ошибок и post_init
+#   [13] main() — регистрация хендлеров и запуск
+#
+# Задачи по расписанию → jobs.py
+# Общие утилиты и валидаторы → helpers.py
+# =============================================================================
 
-# Паттерн допустимых email: только латиница, цифры, точка, дефис, подчёркивание
-EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9._-]{1,64}$')
 
 # Ссылки на активные ConversationHandler — чтобы можно было отменять их программно
 _conv_setting_ref: Optional[ConversationHandler] = None
@@ -57,91 +85,12 @@ _last_start_time: dict = {}  # tg_id -> datetime
 
 def _scheduled_time(hour: int, minute: int = 0) -> time:
     """Создаёт время ежедневной задачи в часовом поясе сервиса."""
-    return time(hour=hour, minute=minute, tzinfo=SCHEDULE_TIMEZONE)
-
-
-def _make_sub_id(length: int = 16) -> str:
-    """Генерирует subId: строчные буквы и цифры."""
-    alphabet = string.ascii_lowercase + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
-
-
-def _client_reply_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Reply-клавиатура для клиента с активной подпиской.
-
-    Остаётся в чате навсегда, пока бот не пришлёт новую или не уберёт.
-    """
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("🔗 Ссылка подписки")],
-            [KeyboardButton("📊 Тарифы")],
-            [KeyboardButton("🆘 Нужна помощь")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return time(hour=hour, minute=minute, tzinfo=_tz())
 
 
 # Инициализируем БД при старте
 init_db()
 
-
-# --- Вспомогательные функции ---
-def _format_bytes(size: int) -> str:
-    if size is None:
-        return "N/A"
-    power = 1024
-    n = 0
-    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power and n < len(power_labels) - 1:
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}B"
-
-
-def _bytes_to_gb(size: int) -> float:
-    return round(size / (1024 ** 3), 2)
-
-
-def _get_panel_api(panel_name: str) -> XUIApi:
-    """Создаёт клиент XUIApi по имени панели."""
-    panel_config = config.get_panel_config(panel_name)
-    return XUIApi(
-        url=panel_config.get("url", ""),
-        username=panel_config.get("username", ""),
-        password=panel_config.get("password", ""),
-        sub_url=panel_config.get("sub_url", ""),
-    )
-
-def _check_panel_available(panel_name: str) -> Optional[str]:
-    """
-    Проверяет, доступна ли панель для работы.
-
-    Возвращает текст ошибки (str) — если работать нельзя,
-             None — если всё в порядке.
-    """
-    panel_config = config.get_panel_config(panel_name)
-    if not panel_config:
-        return f"❌ Панель '{panel_name}' не найдена в config.yml. Возможно, она была удалена через /delpanel."
-    if panel_config.get("disabled", False):
-        return f"❌ Панель '{panel_name}' отключена. Включи в config.yml или через /setting."
-    return None
-
-def _validate_email(email: str) -> Optional[str]:
-    """
-    Проверяет email на допустимые символы.
-
-    Возвращает текст ошибки или None, если всё в порядке.
-    """
-    if not email:
-        return "❌ Email не может быть пустым."
-    if not EMAIL_PATTERN.match(email):
-        return (
-            "❌ Email может содержать только латинские буквы, цифры, точку, "
-            "дефис и подчёркивание. Длина 1–64 символа. Без пробелов."
-        )
-    return None
 
 def _abort_conversation(update: Update, conv: Optional[ConversationHandler]) -> None:
     """Принудительно завершает ConversationHandler для текущего пользователя."""
@@ -424,165 +373,6 @@ async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
 
 
-# --- Хелперы для срока подписки ---
-def _days_to_expiry(days: int) -> tuple:
-    """
-    Возвращает (expiry_ts_ms, expiry_date_str) для now + days.
-
-    Дата берётся в конце дня (23:59:59) по часовому поясу сервиса —
-    так клиент не теряет часть последнего оплаченного дня.
-    """
-    now = datetime.now(SCHEDULE_TIMEZONE)
-    target_date = (now + timedelta(days=days)).date()
-    target_dt = datetime.combine(target_date, time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE)
-    return int(target_dt.timestamp() * 1000), target_date.strftime("%Y-%m-%d")
-
-
-def _parse_expiry_input(text: str) -> tuple:
-    """
-    Парсит текстовый ввод даты окончания.
-
-    Возвращает (expiry_ts_ms, expiry_date_str, error).
-      - /skip: (0, None, None) — бессрочно
-      - дата YYYY-MM-DD: (ts, 'YYYY-MM-DD', None)
-      - ошибка: (None, None, 'сообщение')
-
-    Дата трактуется как конец дня (23:59:59) в часовом поясе сервиса.
-    """
-    text = text.strip().lower()
-    if text in ("/skip", "skip", "пропустить"):
-        return 0, None, None
-
-    try:
-        parsed = datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        return None, None, "Не понял формат. Введи дату `ГГГГ-ММ-ДД`, или нажми кнопку, или `/skip`."
-
-    now = datetime.now(SCHEDULE_TIMEZONE)
-    if parsed.date() < now.date():
-        return None, None, "Дата уже прошла. Введи будущую дату."
-
-    max_date = now + timedelta(days=365 * 10)
-    if parsed > max_date:
-        return None, None, "Дата слишком далеко (максимум 10 лет вперёд)."
-
-    target_dt = datetime.combine(parsed.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE)
-    return int(target_dt.timestamp() * 1000), parsed.strftime("%Y-%m-%d"), None
-
-def _find_bindings_for_admin(tg_id: int, email_filter: str = None) -> list:
-    """Находит связки клиента, опционально фильтруя по email."""
-    bindings = get_user_bindings(tg_id)
-    if email_filter:
-        bindings = [b for b in bindings if b["email"] == email_filter]
-    return bindings
-
-def _render_binding_line(panel_name: str, email: str, mark: str, extra: str = "") -> str:
-    """Строка отчёта вида: Подписка `user123` — ✅ возобновлена (+30 дн., до 2026-XX-XX)"""
-    base = f"Подписка `{email}` — {mark}"
-    if extra:
-        base += f" {extra}"
-    return base
-
-
-async def _send_client_notice(context: ContextTypes.DEFAULT_TYPE, tg_id: int, text: str) -> None:
-    """Отправляет клиенту уведомление с защитой от ошибок."""
-    try:
-        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')
-    except Exception as e:
-        logger.warning(f"Не удалось уведомить клиента {tg_id}: {e}")
-
-
-async def _edit_query_safely(query, text: str) -> None:
-    """Редактирует сообщение с защитой от «текст не изменился»."""
-    try:
-        await query.edit_message_text(text, parse_mode='Markdown')
-    except Exception as e:
-        logger.debug(f"edit_message_text: {e}")
-
-
-def _days_between(start_str: str, end_str: str) -> int:
-    """Сколько дней между двумя строками YYYY-MM-DD. Если что-то не так — 0."""
-    try:
-        d1 = datetime.strptime(start_str, "%Y-%m-%d").date()
-        d2 = datetime.strptime(end_str, "%Y-%m-%d").date()
-        return max(0, (d2 - d1).days)
-    except (ValueError, TypeError):
-        return 0
-
-
-def _parse_extend_argument(text: str) -> tuple:
-    """
-    Парсит аргумент для /extendsub.
-
-    Принимает:
-      - '+30' — добавить 30 дней к текущей дате окончания
-      - '2026-12-31' — установить конкретную дату
-
-    Возвращает (kind, value, error):
-      - kind='days', value=int
-      - kind='date', value='YYYY-MM-DD'
-      - error != None при ошибке
-    """
-    text = text.strip()
-    if text.startswith("+"):
-        try:
-            days = int(text[1:])
-            if days <= 0 or days > 3650:
-                return None, None, "Число дней должно быть от 1 до 3650."
-            return "days", days, None
-        except ValueError:
-            return None, None, "После '+' должно идти целое число дней."
-
-    # Пробуем как дату
-    try:
-        parsed = datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        return None, None, "Введи `+N` (дней) или дату `ГГГГ-ММ-ДД`."
-
-    if parsed.date() < datetime.now().date():
-        return None, None, "Дата уже прошла."
-
-    return "date", parsed.strftime("%Y-%m-%d"), None
-
-def _confirm_keyboard(token: str) -> InlineKeyboardMarkup:
-    """Клавиатура подтверждения: Да / Нет. Токен защищает от нажатия на устаревшую кнопку."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Да", callback_data=f"confirm:yes:{token}"),
-            InlineKeyboardButton("❌ Нет", callback_data=f"confirm:no:{token}"),
-        ]
-    ])
-
-
-async def _ask_confirm(
-    chat_id: int,
-    context: ContextTypes.DEFAULT_TYPE,
-    action: str,
-    payload: dict,
-    preview: str,
-) -> None:
-    """
-    Сохраняет pending action и отправляет превью с кнопками Да/Нет.
-
-    Каждому подтверждению присваивается уникальный токен, чтобы нажатие
-    на устаревшее сообщение не выполнило новое действие.
-
-    :param action: 'pause' | 'resume' | 'extend' | 'revoke' | 'addclient'
-    :param payload: данные, нужные для выполнения действия
-    :param preview: текст превью (Markdown)
-    """
-    token = secrets.token_hex(4)  # 8 hex-символов
-    context.user_data['pending'] = {
-        "action": action,
-        "payload": payload,
-        "token": token,
-    }
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"⚠️ **Подтверди действие**\n\n{preview}",
-        parse_mode='Markdown',
-        reply_markup=_confirm_keyboard(token),
-    )
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка нажатия Да / Нет с проверкой токена."""
@@ -1167,7 +957,7 @@ async def _do_resume(update, context, payload, query) -> None:
             new_dt = old_dt + timedelta(days=pause_days)
             new_expiry_str = new_dt.strftime("%Y-%m-%d")
             new_expiry_dt = datetime.combine(
-                new_dt.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE
+                new_dt.date(), time(23, 59, 59), tzinfo=_tz()
             )
             new_expiry_ts = int(new_expiry_dt.timestamp() * 1000)
             update_kwargs = {"enable": True, "expiryTime": new_expiry_ts}
@@ -1298,7 +1088,7 @@ async def _do_extend(update, context, payload, query) -> None:
 
         new_expiry_str = new_dt.strftime("%Y-%m-%d")
         new_expiry_dt = datetime.combine(
-            new_dt.date(), time(23, 59, 59), tzinfo=SCHEDULE_TIMEZONE
+            new_dt.date(), time(23, 59, 59), tzinfo=_tz()
         )
         new_expiry_ts = int(new_expiry_dt.timestamp() * 1000)
 
@@ -1894,264 +1684,12 @@ async def cancel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-# --- Задачи по расписанию ---
-async def record_traffic_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневная задача: снимок трафика клиентов всех панелей в БД."""
-    logger.info("Запуск задачи: record_traffic_job")
-    all_panels = config.get_all_panels()
-    if not all_panels:
-        logger.warning("record_traffic_job пропущено: панели не настроены.")
-        return
-    today = datetime.now(SCHEDULE_TIMEZONE).strftime("%Y-%m-%d")
-    records = []
-    for name, pconf in all_panels.items():
-        if pconf.get("disabled", False):
-            continue
-        async with _get_panel_api(name) as api:
-            clients = await api.get_all_clients()
-        for c in clients:
-            if not c["email"]:
-                continue
-            records.append((name, c["email"], c["up"], c["down"],
-                            c["total"], c["expiryTime"], today))
-    batch_record_traffic(records)
-    cleanup_old_traffic()
-    logger.info(f"Записано {len(records)} записей трафика за {today}.")
-
-
-def _format_daily_report_text(report_date: str, stats: list,
-                              panel_stats: list, top_users_by_panel: dict) -> str:
-    """Форматирует дневной отчёт: список пользователей отдельно по каждой панели."""
-    if not stats and not panel_stats:
-        return (
-            f"📊 **Дневной отчёт по трафику ({report_date})**\n\n"
-            "**Данные за день недоступны**\n"
-            "- Причина: отсутствует снимок трафика за предыдущий день, точный расход посчитать нельзя."
-        )
-
-    total_upload = sum(s["total_upload"] for s in stats)
-    total_download = sum(s["total_download"] for s in stats)
-    total_traffic = total_upload + total_download
-
-    lines = [
-        f"📊 **Дневной отчёт по трафику ({report_date})**\n",
-        f"**Общий расход**: {_bytes_to_gb(total_traffic)} GB",
-        f"  - Отдано: {_bytes_to_gb(total_upload)} GB",
-        f"  - Принято: {_bytes_to_gb(total_download)} GB\n",
-    ]
-
-    if panel_stats:
-        lines.append("**Расход по панелям:**")
-        for ps in panel_stats:
-            lines.append(f"  - {ps['panel_name']}: {_bytes_to_gb(ps['daily_total'])} GB")
-        lines.append("")
-
-    for panel_name in (ps["panel_name"] for ps in panel_stats):
-        panel_users = top_users_by_panel.get(panel_name, [])
-        if not panel_users:
-            continue
-        lines.append(f"**{panel_name}: Топ 10 пользователей по расходу:**")
-        for i, user in enumerate(panel_users[:10], 1):
-            lines.append(
-                f"  {i}. {user['email']} ({panel_name}): "
-                f"{_bytes_to_gb(user['total_usage'])} GB"
-            )
-        lines.append("")
-
-    return "\n".join(lines).rstrip()
-
-
-async def _generate_daily_report_text() -> str:
-    """Собирает дневной отчёт из базы данных."""
-    report_day = datetime.now(SCHEDULE_TIMEZONE).date() - timedelta(days=1)
-    yesterday = report_day.strftime("%Y-%m-%d")
-    baseline_day = (report_day - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if not has_daily_traffic_snapshot(yesterday) or not has_daily_traffic_snapshot(baseline_day):
-        return _format_daily_report_text(yesterday, [], [], {})
-
-    stats = get_daily_stats(yesterday, yesterday)
-    panel_stats = get_panel_daily_stats(yesterday, yesterday)
-    top_users_by_panel = {
-        ps["panel_name"]: get_top_users(
-            yesterday, yesterday, panel_name=ps["panel_name"], limit=10
-        )
-        for ps in panel_stats
-    }
-
-    return _format_daily_report_text(yesterday, stats, panel_stats, top_users_by_panel)
-
-
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет дневной отчёт всем админам."""
-    logger.info("Запуск задачи: daily_report_job")
-    if not config.is_daily_report_enabled():
-        logger.info("Дневной отчёт отключён, пропускаем.")
-        return
-
-    report_text = await _generate_daily_report_text()
-    for uid in config.get_admin_users():
-        try:
-            await context.bot.send_message(chat_id=uid, text=report_text, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Не удалось отправить отчёт {uid}: {e}")
-
-
 @admin_only
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     report_text = await _generate_daily_report_text()
     await update.message.reply_text(report_text, parse_mode='Markdown')
 
 
-async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет истекающие инбаунды и статус панелей."""
-    logger.info("Запуск задачи: check_inbounds_job")
-    all_panels = config.get_all_panels()
-    if not all_panels:
-        logger.warning("Задача пропущена: панели не настроены.")
-        return
-    admin_users = config.get_admin_users()
-    for name, pconf in all_panels.items():
-        if pconf.get("disabled", False):
-            continue
-        async with _get_panel_api(name) as api:
-            if not await api.login():
-                logger.error(f"Панель '{name}': не удалось подключиться. Отправляем алерт.")
-                for uid in admin_users:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=uid, text=f"🚨 **Панель '{name}' недоступна**",
-                            parse_mode='Markdown'
-                        )
-                    except Exception:
-                        pass
-                continue
-            inbounds_data = await api.get_inbounds()
-        if inbounds_data and inbounds_data.get("success"):
-            three_days_later = (datetime.now(SCHEDULE_TIMEZONE) + timedelta(days=3)).timestamp() * 1000
-            for inbound in inbounds_data.get("obj", []):
-                expiry_ts = inbound.get("expiryTime", 0)
-                if 0 < expiry_ts < three_days_later:
-                    expiry_date = datetime.fromtimestamp(
-                        expiry_ts / 1000, SCHEDULE_TIMEZONE
-                    ).strftime('%Y-%m-%d')
-                    message = (
-                        f"🔔 **Напоминание об истечении ({name})** 🔔\n"
-                        f"- Описание: {inbound.get('remark', 'N/A')}\n"
-                        f"- Истекает: {expiry_date}"
-                    )
-                    for uid in admin_users:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=uid, text=message, parse_mode='Markdown'
-                            )
-                        except Exception:
-                            pass
-
-
-async def _send_client_expiry_notice(
-    context: ContextTypes.DEFAULT_TYPE,
-    tg_id: int,
-    panel_name: str,
-    email: str,
-    expiry_str: str,
-    days_left: int,
-) -> None:
-    """Отправляет клиенту напоминание о скором истечении подписки."""
-    text = (
-        f"⏰ **Напоминание о подписке**\n\n"
-        f"Твоя подписка истекает через **{days_left} дн.** — "
-        f"до **{expiry_str}**.\n\n"
-        f"Позаботься о продлении, чтобы не потерять доступ."
-    )
-    try:
-        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')
-    except Exception as e:
-        logger.warning(f"Не удалось отправить напоминание клиенту {tg_id}: {e}")
-
-
-async def _notify_admins_expired(
-    context: ContextTypes.DEFAULT_TYPE,
-    admin_users: list,
-    tg_id: int,
-    panel_name: str,
-    email: str,
-    expiry_str: str,
-) -> None:
-    """Отправляет всем админам уведомление об истёкшей подписке."""
-    text = (
-        f"❌ **Подписка истекла**\n\n"
-        f"Клиент: `{tg_id}`\n"
-        f"Панель: `{panel_name}`\n"
-        f"Email: `{email}`\n"
-        f"Истекла: `{expiry_str}`\n\n"
-        f"Отозвать: `/revoke {tg_id} {email}`"
-    )
-    for uid in admin_users:
-        try:
-            await context.bot.send_message(chat_id=uid, text=text, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Не удалось уведомить админа {uid}: {e}")
-
-
-async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Ежедневная задача:
-      - за 7 и 3 дня до окончания — напоминание клиенту;
-      - на следующий день после окончания — алерт всем админам.
-    """
-    logger.info("Запуск задачи: expiry_notification_job")
-    bindings = list_all_bindings()
-    if not bindings:
-        logger.info("Нет выданных клиентов — задача пропущена.")
-        return
-
-    today = datetime.now(SCHEDULE_TIMEZONE).date()
-    admin_users = config.get_admin_users()
-    sent_count = 0
-
-    for b in bindings:
-        expiry_str = b.get("expiry_date")
-        if not expiry_str:
-            continue  # бессрочно
-
-        # Подписка на паузе — не тревожим клиента
-        if b.get("paused_at"):
-            continue
-
-        try:
-            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-        except ValueError:
-            logger.warning(f"Некорректная дата '{expiry_str}' у {b['panel_name']}/{b['email']}")
-            continue
-
-        days_left = (expiry_date - today).days
-        tg_id = b["tg_id"]
-        panel_name = b["panel_name"]
-        email = b["email"]
-
-        # За 7 дней
-        if days_left == 7:
-            if not has_recent_notification(tg_id, panel_name, email, "7d", expiry_str):
-                await _send_client_expiry_notice(context, tg_id, panel_name, email, expiry_str, 7)
-                log_notification(tg_id, panel_name, email, "7d", expiry_str)
-                sent_count += 1
-
-        # За 3 дня
-        elif days_left == 3:
-            if not has_recent_notification(tg_id, panel_name, email, "3d", expiry_str):
-                await _send_client_expiry_notice(context, tg_id, panel_name, email, expiry_str, 3)
-                log_notification(tg_id, panel_name, email, "3d", expiry_str)
-                sent_count += 1
-
-        # На следующий день после окончания
-        elif days_left == -1:
-            if not has_recent_notification(tg_id, panel_name, email, "expired", expiry_str):
-                await _notify_admins_expired(context, admin_users, tg_id, panel_name, email, expiry_str)
-                log_notification(tg_id, panel_name, email, "expired", expiry_str)
-                sent_count += 1
-
-    logger.info(f"Задача завершена. Отправлено уведомлений: {sent_count}.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Логирует исключения в хендлерах и говорит пользователю, что что-то сломалось."""

@@ -1,13 +1,16 @@
 ## ✨ Основные возможности
 
 - **Мультипанельность**: один бот — все ваши панели 3x-ui.
-- **Выдача подписок через бота**: клиент нажимает `/start`, админ делает `/addclient` — подписка уходит клиенту автоматически.
-- **Автоматические задачи**:
-    - Оповещение о недоступности панелей.
-    - Напоминание об истечении инбаундов.
-    - Ежедневный снимок трафика и отчёт.
-    - Ежемесячный автосброс трафика.
-- **Безопасность**: разделение прав админа и клиента, пароли не остаются в истории чата.
+- **Выдача подписок через бота**: клиент нажимает `/start`, админ делает
+  `/addclient` — подписка приходит клиенту автоматически.
+- **Пауза и продление**: `/pausesub` замораживает срок, `/resumesub` продлевает
+  на дни паузы, `/extendsub` продлевает вручную.
+- **Автоматические задачи**: напоминания клиентам за 7 и 3 дня, алерт админам
+  после истечения, дневной отчёт, проверка панелей каждые 6 часов.
+- **Роль суперадмина**: чувствительные команды (`/setting`, `/delpanel`) доступны
+  только первому в списке админов.
+- **Безопасность**: пароли панелей в `gitignore`, автоудаление пароля в диалоге,
+  подтверждение опасных действий кнопками Да/Нет.
 
 ---
 
@@ -15,16 +18,17 @@
 
 ```
 TgXUIMgr/
-├── main.py               # Бот: команды, диалоги, задачи по расписанию
-├── config.py             # Работа с config.yml, валидация URL панелей
-├── database.py           # SQLite: трафик, привязки клиентов
+├── main.py               # Точка входа и хендлеры: команды, диалоги, callback
+├── helpers.py            # Общие утилиты: формат, валидация, клавиатуры, панели
+├── jobs.py               # Задачи по расписанию
+├── config.py             # Работа с config.yml, валидация URL, суперадмин
+├── database.py           # SQLite: трафик, привязки, пользователи бота
 ├── xui_api.py            # HTTP-клиент панели 3x-ui 3.8.x
-├── query_logic.py        # Логика запроса трафика по email
 │
-├── config.yml            # Реальный конфиг (не коммитится!)
+├── config.yml            # Личный конфиг (не коммитится)
 ├── config.yml.example    # Шаблон конфига
+├── requirements.txt      # Зависимости (с пинами версий)
 │
-├── requirements.txt      # Зависимости
 ├── Dockerfile            # Сборка образа
 ├── docker-compose.yml    # Запуск на сервере
 ├── .gitignore            # Что не коммитить
@@ -35,17 +39,17 @@ TgXUIMgr/
 ├── MIGRATION.md          # Инструкция по переезду
 │
 ├── data/                 # SQLite-база (не коммитится)
-├── tests/                # Тесты
 └── .venv/                # Python venv (не коммитится)
 ```
 
 | Файл | Что делает |
 |------|-----------|
-| `main.py` | Единственная точка входа. Регистрирует команды бота, диалоги `/setting` и `/addclient`, ежедневные задачи. |
-| `config.py` | Читает и пишет `config.yml`. Валидирует URL. |
-| `database.py` | SQLite: три таблицы — `traffic_records`, `client_bindings`, `bot_users`. |
-| `xui_api.py` | Общается с панелью 3x-ui по HTTPS. |
-| `query_logic.py` | Функция «найти клиента по email и вернуть трафик/срок». |
+| `main.py` | Регистрирует команды, диалоги `/setting` и `/addclient`, callback-обработчики |
+| `helpers.py` | Хелперы, используемые `main.py` и `jobs.py` |
+| `jobs.py` | Задачи по расписанию: снимок, отчёт, проверка панелей, напоминания |
+| `config.py` | Читает и пишет `config.yml`, валидирует URL, проверяет суперадмина |
+| `database.py` | Четыре таблицы: `traffic_records`, `bot_users`, `client_bindings`, `notification_log` |
+| `xui_api.py` | Общается с панелью 3x-ui по HTTPS |
 
 ---
 
@@ -53,28 +57,34 @@ TgXUIMgr/
 
 ### Шаг 1. Подготовка
 
-Установите [Docker](https://docs.docker.com/engine/install/) и [Docker Compose](https://docs.docker.com/compose/install/).
+Установи [Docker](https://docs.docker.com/engine/install/) и
+[Docker Compose](https://docs.docker.com/compose/install/).
 
 ### Шаг 2. Настройка
 
-1. Клонируйте репозиторий:
+1. Клонируй репозиторий:
+
    ```bash
    git clone https://github.com/GeQainZz/TgXUIMgr.git
-   cd TgXUIMgr
+   cd XUIHelper
    ```
 
-2. Создайте `config.yml`:
+2. Создай `config.yml`:
+
    ```bash
    cp config.yml.example config.yml
    ```
-   Откройте и заполните:
+
+3. Открой `config.yml` и заполни:
+
    ```yaml
    bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
 
+   timezone: "Asia/Hong_Kong"
+
    users:
      admin_users:
-       - 123456789  # Ваш Telegram User ID
-     normal_users: []
+       - 123456789       # ПЕРВЫЙ = суперадмин
 
    panels:
      "TMT":
@@ -83,15 +93,20 @@ TgXUIMgr/
        password: "your_password"
        sub_url: "https://185.200.190.40:2096/sub"
 
-   monthly_reset:
-     enable: false
-
    traffic:
-     accounting_mode: 'unidirectional'
+     accounting_mode: unidirectional
+
+   policy:
+     url: ""
+     message: ""
+
+   tariffs:
+     url: ""
+     message: ""
    ```
 
    > **Как узнать Telegram User ID?**
-   > Найдите в Telegram `@userinfobot` и начните диалог.
+   > Напиши `@userinfobot` в Telegram.
 
 ### Шаг 3. Запуск
 
@@ -99,7 +114,7 @@ TgXUIMgr/
 docker-compose up -d --build
 ```
 
-Готово! Бот работает.
+Готово. Бот работает.
 
 ---
 
@@ -108,22 +123,39 @@ docker-compose up -d --build
 ### Для админа
 
 ```
-/setting                                # добавить панель через диалог
-/inbounds TMT                           # список инбаундов с ID
 /addclient 123456789 user123 TMT 8 9    # создать клиента
-/revoke 123456789                       # удалить клиента
-/listclients                            # список всех выданных
-/status                                 # статус всех панелей
-/report                                 # дневной отчёт сейчас
+/revoke 123456789 user123               # удалить
+/pausesub 123456789 user123             # приостановить
+/resumesub 123456789 user123            # возобновить
+/extendsub 123456789 +30 user123        # продлить
+/listclients                            # список (постранично)
+/getlink 123456789 user123              # получить ссылку
+/inbounds TMT                           # список инбаундов
+/status TMT                             # статус панели
+/listpanels                             # все панели
+/report                                 # дневной отчёт
+```
+
+### Только для суперадмина (первый в списке)
+
+```
+/setting                                # добавить/обновить панель
+/delpanel TMT                           # удалить панель из бота
 ```
 
 ### Для клиента
 
 ```
 /start                                  # активировать бота
-/mylink                                 # получить ссылку подписки
-/mystatus                               # посмотреть свой трафик
+/mylink                                 # получить ссылку
+/policy                                 # политика конфиденциальности
 ```
+
+Плюс reply-клавиатура с тремя кнопками после создания подписки:
+
+- 🔗 Ссылка подписки
+- 📊 Тарифы
+- 🆘 Нужна помощь
 
 ---
 
@@ -132,19 +164,23 @@ docker-compose up -d --build
 ```bash
 docker-compose logs -f          # логи
 docker-compose down             # остановить
-docker-compose up -d --build    # пересобрать и запустить
+docker-compose up -d --build    # пересобрать
 ```
 
 ---
 
 ## ⚙️ Ручное развёртывание
 
-1. Установите зависимости:
+1. Установи зависимости:
+
    ```bash
    pip install -r requirements.txt
    ```
-2. Настройте `config.yml` (см. Шаг 2).
-3. Запустите:
+
+2. Настрой `config.yml` (см. Шаг 2).
+
+3. Запусти:
+
    ```bash
    nohup python3 main.py &
    ```
@@ -154,16 +190,21 @@ docker-compose up -d --build    # пересобрать и запустить
 ## ⁉️ FAQ
 
 **В: Как узнать свой Telegram User ID?**
-О: В Telegram напишите `@userinfobot`, он пришлёт ваш ID.
+О: В Telegram напиши `@userinfobot`.
 
-**В: Клиент не получает подписку после `/addclient`?**
-О: Клиент должен сначала нажать `/start` у бота. Telegram не даёт ботам писать первыми.
+**В: Клиент не получает подписку после `/addclient`.**
+О: Клиент должен сначала нажать `/start` у бота. Telegram не даёт ботам писать
+первыми.
 
 **В: Как узнать ID инбаунда?**
 О: Команда `/inbounds TMT` покажет все инбаунды с их ID.
 
 **В: Где посмотреть логи бота?**
-О: `docker-compose logs -f` (в Docker) или `tail -f nohup.out` (при ручном запуске).
+О: `docker-compose logs -f` (Docker) или `tail -f nohup.out` (ручной запуск).
 
 **В: Как обновить бота?**
 О: `docker-compose down && git pull && docker-compose up -d --build`.
+
+**В: Можно ли запускать второй диалог, пока первый активен?**
+О: Нет. Но если запустишь — бот **автоматически отменит** первый диалог и
+продолжит второй. Ничего не сломается.

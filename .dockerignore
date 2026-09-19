@@ -4,8 +4,6 @@ data/
 *.db
 *.db-shm
 *.db-wal
-
-# Сертификаты
 certs/
 
 # Python
@@ -34,7 +32,7 @@ env/
 tests/
 *.md
 
-# Логи
+# Логи и фоновые артефакты
 *.log
 nohup.out
 
