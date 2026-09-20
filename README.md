@@ -39,16 +39,11 @@ XUIHelper/
 ├── config.yml.example    # Шаблон конфига
 ├── requirements.txt      # Зависимости (с пинами версий)
 │
-├── Dockerfile            # Опционально: сборка образа
-├── docker-compose.yml    # Опционально: запуск в Docker
-├── .gitignore            # Что не коммитить
-├── .dockerignore         # Что не копировать в образ
-├── .flake8               # Конфиг линтера
-│
 ├── README.md             # Это руководство
 ├── MANUAL.md             # Подробное руководство
-├── MIGRATION.md          # Инструкция по переезду и SSL
+├── MIGRATION.md          # Инструкция по развёртыванию и переезду
 ├── LICENSE               # MIT
+├── ver.md                # Описание мажорных и минорных версий
 │
 ├── data/                 # SQLite-база (не коммитится)
 └── .venv/                # Python venv (не коммитится)
@@ -57,7 +52,7 @@ XUIHelper/
 | Файл | Что делает |
 |------|-----------|
 | `main.py` | Регистрирует команды, диалоги `/setting` и `/addclient`, callback-обработчики |
-| `helpers.py` | Хелперы для `main.py` и `jobs.py`: форматирование, валидация, клавиатуры, работа с панелями |
+| `helpers.py` | Хелперы для `main.py` и `jobs.py`: форматирование, валидация, клавиатуры |
 | `jobs.py` | Задачи по расписанию: снимок трафика, отчёт, проверка панелей, напоминания |
 | `config.py` | Читает и пишет `config.yml`, валидирует URL, проверяет суперадмина |
 | `database.py` | Четыре таблицы: `traffic_records`, `bot_users`, `client_bindings`, `notification_log` |
@@ -65,67 +60,204 @@ XUIHelper/
 
 ---
 
-## 🚀 Быстрый старт
+## 🚀 Установка
 
-### Вариант A. venv + systemd (рекомендуемый для VPS с ограниченной RAM)
+### Требования
 
-**Требования:** Debian/Ubuntu, Python 3.11+, root-доступ.
+- VPS с Linux (Alpine / Debian / Ubuntu).
+- Python 3.11+.
+- Git, curl, gcc/make.
+- **SSH-доступ к панели 3x-ui** — если Telegram блокируется в вашем регионе (Россия).
 
-1. **Установить Python 3.11** (если на сервере < 3.11):
+### Шаг 1. Установка системных зависимостей
 
-   ```bash
-   apt update
-   apt install -y make build-essential libssl-dev zlib1g-dev \
-       libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
-       libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
-       libffi-dev liblzma-dev
-
-   curl https://pyenv.run | bash
-
-   echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
-   echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
-   echo 'eval "$(pyenv init -)"' >> ~/.bashrc
-   source ~/.bashrc
-
-   pyenv install 3.11.9
-   ```
-
-2. **Клонировать проект:**
-
-   ```bash
-   cd /root
-   git clone https://github.com/<твой-аккаунт>/XUIHelper.git
-   cd XUIHelper
-   pyenv local 3.11.9
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. **Настроить `config.yml`:**
-
-   ```bash
-   cp config.yml.example config.yml
-   vi config.yml
-   ```
-
-4. **Создать systemd-сервис** — см. `MANUAL.md`, раздел 10.
-
-5. **Запустить:**
-
-   ```bash
-   systemctl start xuihelper
-   systemctl status xuihelper
-   ```
-
-### Вариант B. Docker (для серверов с RAM ≥ 1 ГБ)
+**Alpine:**
 
 ```bash
-git clone https://github.com/<твой-аккаунт>/XUIHelper.git
+apk add --no-cache git python3 py3-pip gcc make musl-dev \
+    python3-dev libffi-dev openssl-dev yaml-dev tzdata logrotate
+```
+
+**Debian / Ubuntu:**
+
+```bash
+apt update
+apt install -y git python3 python3-venv python3-pip \
+    build-essential libssl-dev libffi-dev libyaml-dev tzdata
+```
+
+### Шаг 2. Клонирование и окружение
+
+```bash
+cd /root
+git clone https://github.com/iskanderinka/XUIHelper.git
 cd XUIHelper
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Шаг 3. Конфигурация
+
+```bash
 cp config.yml.example config.yml
 vi config.yml
-docker-compose up -d --build
+```
+
+Минимум, что нужно заполнить:
+
+```yaml
+bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+
+users:
+  admin_users:
+    - 197066617       # ← суперадмин (первый)
+
+panels:
+  "TMT":
+    url: "https://panel-host:port/PATH"
+    username: "admin"
+    password: "..."
+    sub_url: "https://panel-host:port/sub"
+
+timezone: "Asia/Hong_Kong"
+```
+
+### Шаг 4. Прокси для Telegram (если нужно)
+
+**Если Telegram доступен с вашего сервера напрямую** — пропустите этот шаг.
+
+**Если Telegram блокируется** (типично для РФ) — нужен SOCKS5-туннель через сервер за границей:
+
+```bash
+# Создаём SSH-ключ
+ssh-keygen -t ed25519 -C "tunnel@xuihelper" -f ~/.ssh/id_ed25519 -N ""
+
+# Копируем публичный ключ на удалённый сервер
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@YOUR_REMOTE_SERVER
+
+# Проверяем, что работает без пароля
+ssh -o PasswordAuthentication=no root@YOUR_REMOTE_SERVER "echo OK"
+```
+
+Подробности — в `MIGRATION.md`, раздел «Туннель для Telegram».
+
+### Шаг 5. Проверка запуска
+
+```bash
+cd /root/XUIHelper
+source .venv/bin/activate
+
+# Если используется туннель
+export HTTPS_PROXY=socks5://127.0.0.1:1080
+export HTTP_PROXY=socks5://127.0.0.1:1080
+export ALL_PROXY=socks5://127.0.0.1:1080
+
+python3 main.py
+```
+
+В логе должно появиться:
+
+```
+database - INFO - Database initialised at ...
+__main__ - INFO - Бот запущен...
+telegram.ext.Application - INFO - Application started
+```
+
+Напишите боту в Telegram `/start` — если отвечает, всё работает. Остановите `Ctrl+C`.
+
+### Шаг 6. Автозапуск через OpenRC (Alpine)
+
+```bash
+# Туннель (если нужен)
+cat > /etc/init.d/tg-tunnel << 'EOF'
+#!/sbin/openrc-run
+
+name="Telegram SSH tunnel"
+
+command="/usr/bin/ssh"
+command_args="-N -D 127.0.0.1:1080 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o BatchMode=yes \
+    root@YOUR_REMOTE_SERVER"
+
+command_user="root"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+command_background="yes"
+output_log="/var/log/tg-tunnel.log"
+error_log="/var/log/tg-tunnel.err"
+
+respawn_delay=5
+respawn_max=0
+
+depend() {
+    need net
+}
+EOF
+
+chmod +x /etc/init.d/tg-tunnel
+rc-update add tg-tunnel default
+rc-service tg-tunnel start
+```
+
+```bash
+# Бот
+cat > /etc/init.d/xuihelper << 'EOF'
+#!/sbin/openrc-run
+
+name="XUIHelper Telegram bot"
+
+command="/root/XUIHelper/.venv/bin/python"
+command_args="-u main.py"
+command_user="root:root"
+directory="/root/XUIHelper"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+command_background="yes"
+output_log="/var/log/xuihelper.log"
+error_log="/var/log/xuihelper.err"
+
+export HTTPS_PROXY="socks5://127.0.0.1:1080"
+export HTTP_PROXY="socks5://127.0.0.1:1080"
+export ALL_PROXY="socks5://127.0.0.1:1080"
+
+respawn_delay=10
+respawn_max=0
+
+depend() {
+    need net
+    use tg-tunnel
+}
+EOF
+
+chmod +x /etc/init.d/xuihelper
+rc-update add xuihelper default
+rc-service xuihelper start
+```
+
+### Шаг 7. Logrotate для логов
+
+```bash
+cat > /etc/logrotate.d/xuihelper << 'EOF'
+/var/log/xuihelper.log /var/log/xuihelper.err /var/log/tg-tunnel.log /var/log/tg-tunnel.err {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+echo "0 3 * * * logrotate /etc/logrotate.d/xuihelper" >> /etc/crontabs/root
+rc-service crond restart
 ```
 
 ---
@@ -136,7 +268,7 @@ docker-compose up -d --build
 
 | Команда | Что делает |
 |---------|-----------|
-| `/start` | Активировать бота, получить TG ID |
+| `/start` | Активировать бота, получить TG ID, отправить заявку |
 | `/help` | Справка |
 | `/guide` | Гайд по боту |
 | `/policy` | Политика конфиденциальности |
@@ -150,8 +282,6 @@ docker-compose up -d --build
 [🆘 Нужна помощь]
 ```
 
-**Заявка:** при `/start` появляется inline-кнопка «📝 Отправить заявку». По нажатию кнопка исчезает, админам приходит уведомление с TG ID, именем и username клиента.
-
 ### Для админа
 
 | Команда | Что делает |
@@ -159,13 +289,13 @@ docker-compose up -d --build
 | `/addclient <tg_id> <email> <панель> <id1> [id2]...` | Создать клиента |
 | `/revoke <tg_id> [email]` | Удалить клиента |
 | `/pausesub <tg_id> [email]` | Приостановить подписку |
-| `/resumesub <tg_id> [email]` | Возобновить и продлить на дни паузы |
+| `/resumesub <tg_id> [email]` | Возобновить |
 | `/extendsub <tg_id> <+N \| дата> [email]` | Продлить |
-| `/listclients` | Список клиентов (постранично) |
+| `/listclients` | Список клиентов |
 | `/getlink <tg_id> [email]` | Получить sub-ссылку |
-| `/inbounds <панель>` | Список инбаундов с ID |
-| `/status <панель>` | Подробный статус панели |
-| `/listpanels` | Список панелей со статусом |
+| `/inbounds <панель>` | Список инбаундов |
+| `/status <панель>` | Статус панели |
+| `/listpanels` | Все панели |
 | `/report` | Дневной отчёт |
 | `/guideadmin` | Гайд для админа |
 
@@ -177,34 +307,33 @@ docker-compose up -d --build
 [📅 Продлить]    [🗑️ Удалить]
 ```
 
-### Для суперадмина (первый в списке)
+### Для суперадмина
 
 Всё, что у админа, **плюс**:
 
 | Команда | Что делает |
 |---------|-----------|
 | `/setting` | Добавить или обновить панель |
-| `/delpanel <имя>` | Удалить панель из config.yml |
+| `/delpanel <имя>` | Удалить панель |
 | `/guidesuper` | Гайд для суперадмина |
 
 ---
 
-## 🔧 Управление (systemd)
+## 🔧 Управление (Alpine / OpenRC)
 
 ```bash
-systemctl status xuihelper    # статус
-systemctl restart xuihelper   # перезапуск
-systemctl stop xuihelper      # остановка
-journalctl -u xuihelper -f    # логи в реальном времени
-journalctl -u xuihelper -n 100  # последние 100 строк
+rc-service xuihelper status    # статус
+rc-service xuihelper restart   # перезапуск
+rc-service xuihelper stop      # остановка
+tail -f /var/log/xuihelper.err # логи в реальном времени
 ```
 
-## 🐳 Управление (Docker)
+## 🔧 Управление (Debian / systemd)
 
 ```bash
-docker-compose logs -f
-docker-compose down
-docker-compose up -d --build
+systemctl status xuihelper
+systemctl restart xuihelper
+journalctl -u xuihelper -f
 ```
 
 ---
@@ -220,16 +349,22 @@ docker-compose up -d --build
 **В: Как узнать ID инбаунда?**
 О: Команда `/inbounds TMT` покажет все инбаунды с их ID.
 
-**В: Где посмотреть логи?**
-О: `journalctl -u xuihelper -f` (systemd) или `docker-compose logs -f` (Docker).
+**В: Бот не подключается к Telegram (таймаут).**
+О: Скорее всего, Telegram блокируется в вашем регионе. Настройте SSH SOCKS5-туннель (см. `MIGRATION.md`).
+
+**В: Логи бота пишутся в `.err`, а не в `.log`.**
+О: Это нормально. Python `logging` пишет в stderr. Все INFO/ERROR идут в `.err`.
 
 **В: Как обновить бота?**
 О:
-- venv: `cd /root/XUIHelper && git pull && source .venv/bin/activate && pip install -r requirements.txt && systemctl restart xuihelper`
-- Docker: `docker-compose down && git pull && docker-compose up -d --build`
-
-**В: Можно ли запускать второй диалог, пока первый активен?**
-О: Нет. Но если запустишь — бот **автоматически отменит** первый и продолжит второй. Ничего не сломается.
+```bash
+cd /root/XUIHelper
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+deactivate
+rc-service xuihelper restart
+```
 
 ---
 

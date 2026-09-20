@@ -263,69 +263,186 @@ python3 main.py
 
 Чтобы назначить/сменить — правь `config.yml` руками и перезапускай бота.
 
-## 10. Развёртывание через systemd (рекомендуемое)
+## 10. Развёртывание
 
-### 10.1. Подготовка
+### 10.1. Выбор сервера
 
-1. Установи Python 3.11 через pyenv (см. `README.md`).
-2. Клонируй проект:
+Возможны три схемы:
 
-   ```bash
-   cd /root
-   git clone https://github.com/<твой-аккаунт>/XUIHelper.git
-   cd XUIHelper
-   ```
+| Схема | Когда подходит |
+|-------|----------------|
+| Бот и панель на одном сервере | Панель и бот делят 1 ГБ+ RAM, IP сервера не блокируется РКН |
+| Бот на отдельном сервере в РФ | Панель отдельно, бот в РФ, между ними SSH-туннель |
+| Бот на зарубежном сервере | Панель и бот раздельно, Telegram доступен напрямую |
 
-3. Создай venv и установи зависимости:
+Эта инструкция описывает **вторую схему** — бот в РФ, панель за границей, SSH-туннель для Telegram.
 
-   ```bash
-   pyenv local 3.11.9
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-4. Настрой `config.yml`.
-
-### 10.2. systemd-сервис
-
-Создай `/etc/systemd/system/xuihelper.service`:
-
-```ini
-[Unit]
-Description=XUIHelper Telegram bot
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/root/XUIHelper
-ExecStart=/root/XUIHelper/.venv/bin/python main.py
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Запусти:
+### 10.2. Установка зависимостей (Alpine)
 
 ```bash
-systemctl daemon-reload
-systemctl enable xuihelper
-systemctl start xuihelper
-systemctl status xuihelper
+apk add --no-cache git python3 py3-pip gcc make musl-dev \
+    python3-dev libffi-dev openssl-dev yaml-dev tzdata logrotate
 ```
 
-### 10.3. Логи
-
-systemd автоматически ротирует логи. Управление:
+### 10.3. Клонирование
 
 ```bash
-journalctl -u xuihelper -f           # следить в реальном времени
-journalctl -u xuihelper -n 100       # последние 100 строк
-journalctl -u xuihelper --since "1 hour ago"
+cd /root
+git clone https://github.com/iskanderinka/XUIHelper.git
+cd XUIHelper
+```
+
+### 10.4. Окружение
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 10.5. Конфигурация
+
+Скопируй `config.yml` с рабочей машины через scp (там уже настроены токены, панели, ссылки):
+
+```bash
+# С ноутбука
+scp ~/XUIHelper/config.yml root@YOUR_RU_SERVER:/root/XUIHelper/config.yml
+```
+
+Или заполни `config.yml` на месте — см. раздел 5.
+
+**Важно:** URL панели должен быть **внешним** (не `127.0.0.1`), потому что панель на другом сервере.
+
+### 10.6. SSH SOCKS5-туннель
+
+**Проверь, доступен ли Telegram напрямую:**
+
+```bash
+curl -s --max-time 10 https://api.telegram.org/bot123:test/getMe
+```
+
+**Если ответ `{"ok":false,...}` — Telegram доступен, туннель не нужен.** Пропусти этот раздел.
+
+**Если timeout** — туннель обязателен.
+
+```bash
+# Ключ
+ssh-keygen -t ed25519 -C "tunnel@xuihelper" -f ~/.ssh/id_ed25519 -N ""
+
+# Копирование ключа на зарубежный сервер
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@YOUR_REMOTE_SERVER
+
+# Проверка
+ssh -o PasswordAuthentication=no root@YOUR_REMOTE_SERVER "echo OK"
+```
+
+Создай `/etc/init.d/tg-tunnel`:
+
+```bash
+cat > /etc/init.d/tg-tunnel << 'EOF'
+#!/sbin/openrc-run
+
+name="Telegram SSH tunnel"
+
+command="/usr/bin/ssh"
+command_args="-N -D 127.0.0.1:1080 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o BatchMode=yes \
+    root@YOUR_REMOTE_SERVER"
+
+command_user="root"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+command_background="yes"
+output_log="/var/log/tg-tunnel.log"
+error_log="/var/log/tg-tunnel.err"
+
+respawn_delay=5
+respawn_max=0
+
+depend() {
+    need net
+}
+EOF
+
+chmod +x /etc/init.d/tg-tunnel
+rc-update add tg-tunnel default
+rc-service tg-tunnel start
+```
+
+**Проверка:**
+
+```bash
+ss -tlnp | grep 1080
+curl -s --max-time 10 --proxy socks5h://127.0.0.1:1080 https://api.telegram.org/bot123:test/getMe
+```
+
+**Важно:** используй `socks5h://` (а не `socks5://`) — тогда DNS-резолв произойдёт на удалённом сервере. Иначе curl будет резолвить у себя, найдёт IPv6 адрес Telegram, а у удалённого сервера может не быть IPv6-маршрута.
+
+### 10.7. OpenRC-сервис для бота
+
+```bash
+cat > /etc/init.d/xuihelper << 'EOF'
+#!/sbin/openrc-run
+
+name="XUIHelper Telegram bot"
+
+command="/root/XUIHelper/.venv/bin/python"
+command_args="-u main.py"
+command_user="root:root"
+directory="/root/XUIHelper"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+command_background="yes"
+output_log="/var/log/xuihelper.log"
+error_log="/var/log/xuihelper.err"
+
+export HTTPS_PROXY="socks5://127.0.0.1:1080"
+export HTTP_PROXY="socks5://127.0.0.1:1080"
+export ALL_PROXY="socks5://127.0.0.1:1080"
+
+respawn_delay=10
+respawn_max=0
+
+depend() {
+    need net
+    use tg-tunnel
+}
+EOF
+
+chmod +x /etc/init.d/xuihelper
+rc-update add xuihelper default
+rc-service xuihelper start
+```
+
+**Проверка:**
+
+```bash
+rc-service xuihelper status
+tail -20 /var/log/xuihelper.err
+```
+
+### 10.8. Logrotate
+
+```bash
+cat > /etc/logrotate.d/xuihelper << 'EOF'
+/var/log/xuihelper.log /var/log/xuihelper.err /var/log/tg-tunnel.log /var/log/tg-tunnel.err {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+echo "0 3 * * * logrotate /etc/logrotate.d/xuihelper" >> /etc/crontabs/root
+rc-service crond restart
 ```
 
 ## 11. Развёртывание через Docker (опционально)
