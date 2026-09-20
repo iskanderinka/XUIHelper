@@ -247,6 +247,23 @@ def _client_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Reply-клавиатура для админа и суперадмина.
+
+    Одна и та же для обеих ролей. Остаётся в чате навсегда.
+    """
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("➕ Добавить пользователя")],
+            [KeyboardButton("⏸️ Пауза"), KeyboardButton("▶️ Продолжить")],
+            [KeyboardButton("📅 Продлить"), KeyboardButton("🗑️ Удалить")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def _confirm_keyboard(token: str) -> InlineKeyboardMarkup:
     """Клавиатура подтверждения: Да / Нет. Токен защищает от нажатия на устаревшую кнопку."""
     return InlineKeyboardMarkup([
@@ -312,3 +329,84 @@ async def _edit_query_safely(query, text: str) -> None:
         await query.edit_message_text(text, parse_mode='Markdown')
     except Exception as e:
         logger.debug(f"edit_message_text: {e}")
+
+
+# ---------- Inline-клавиатура выбора клиента для админских действий ----------
+
+_ADMIN_ACTION_TITLES = {
+    "pause": "⏸️ Пауза — выбери клиента",
+    "resume": "▶️ Продолжить — выбери клиента",
+    "extend": "📅 Продлить — выбери клиента",
+    "revoke": "🗑️ Удалить — выбери клиента",
+}
+
+ADMIN_ACTION_PAGE_SIZE = 5
+
+
+def _admin_action_keyboard(
+    bindings: list,
+    action: str,
+    page: int,
+    page_size: int = ADMIN_ACTION_PAGE_SIZE,
+) -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора клиента для админского действия."""
+    total = len(bindings)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * page_size
+    end = start + page_size
+    chunk = bindings[start:end]
+
+    rows = []
+    for b in chunk:
+        label = f"{b['panel_name']}/{b['email']}"
+        # Telegram ограничивает callback_data 64 байтами.
+        # panel_name и email не должны содержать ':' — предполагаем это.
+        cb = f"admact:sel:{action}:{b['tg_id']}:{b['panel_name']}"
+        if len(cb.encode("utf-8")) > 60:
+            # Fallback: обрезаем
+            label = label[:27] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=cb)])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "◀️", callback_data=f"admact:page:{action}:{page - 1}"
+        ))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(
+            "▶️", callback_data=f"admact:page:{action}:{page + 1}"
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="admact:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_admin_action_page(
+    bindings: list,
+    action: str,
+    page: int,
+    page_size: int = ADMIN_ACTION_PAGE_SIZE,
+) -> tuple:
+    """Возвращает (text, keyboard) для страницы выбора клиента."""
+    total = len(bindings)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * page_size
+    end = start + page_size
+    chunk = bindings[start:end]
+
+    title = _ADMIN_ACTION_TITLES.get(action, action)
+    lines = [f"**{title}** (страница {page + 1}/{total_pages}):\n"]
+    for b in chunk:
+        expiry = b.get("expiry_date") or "бессрочно"
+        status_icon = "⏸️" if b.get("paused_at") else "▶️"
+        lines.append(f"{status_icon} `{b['panel_name']}/{b['email']}` — до `{expiry}`")
+
+    text = "\n".join(lines)
+    keyboard = _admin_action_keyboard(bindings, action, page, page_size)
+    return text, keyboard

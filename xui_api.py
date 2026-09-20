@@ -301,7 +301,6 @@ class XUIApi:
         logger.error(f"Ошибка удаления клиента '{email}': {data}")
         return False
 
-
     # ---- Получение полного объекта клиента ----
 
     async def get_client_object(self, email: str) -> Optional[Dict[str, Any]]:
@@ -419,7 +418,6 @@ class XUIApi:
             return True
         logger.error(f"Ошибка обновления клиента '{email}': {data}")
         return None
-
 
     # ---- Sub-ссылка ----
 

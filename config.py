@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
     "panels": {}
 }
 
+
 def _validate_panel_url(url: str) -> tuple:
     """
     Проверяет, что URL панели безопасен и валиден.
@@ -105,10 +106,12 @@ def get_admin_users() -> List[int]:
             continue
     return result
 
+
 def is_admin(user_id: int) -> bool:
     return user_id in get_admin_users()
 
 # ---------- Панели ----------
+
 
 def get_panel_config(name: str) -> Dict[str, str]:
     """Возвращает конфигурацию панели по имени."""
@@ -231,6 +234,7 @@ def get_tariffs_message() -> str:
 
 # ---------- Суперадмин ----------
 
+
 def get_superadmin_id() -> int | None:
     """
     Возвращает ID суперадмина — первого в списке admin_users.
@@ -265,3 +269,34 @@ def get_timezone() -> str:
     except Exception:
         return "Asia/Hong_Kong"
     return tz
+
+
+# ---------- Гайды ----------
+
+_DEFAULT_GUIDE_MESSAGES = {
+    "client": (
+        "📚 **Гайд по боту**\n\n"
+        "Здесь будет полное описание работы бота для клиента."
+    ),
+    "admin": (
+        "📚 **Гайд для администратора**\n\n"
+        "Здесь будет полное описание работы бота для администратора."
+    ),
+    "superadmin": (
+        "📚 **Гайд для суперадминистратора**\n\n"
+        "Здесь будет полное описание работы бота для суперадминистратора."
+    ),
+}
+
+
+def get_guide_url(role: str) -> str:
+    """URL статьи гайда для роли ('client' | 'admin' | 'superadmin')."""
+    return (config.get("guide", {}).get(role, {}).get("url") or "").strip()
+
+
+def get_guide_message(role: str) -> str:
+    """Текст сообщения гайда для роли. Если не задан — стандартный."""
+    msg = (config.get("guide", {}).get(role, {}).get("message") or "").strip()
+    if msg:
+        return msg
+    return _DEFAULT_GUIDE_MESSAGES.get(role, "")

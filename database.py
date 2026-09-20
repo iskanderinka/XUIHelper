@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 DB_DIR = os.environ.get("DB_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 DB_PATH = os.path.join(DB_DIR, "traffic.db")
 
+
 def _get_conn() -> sqlite3.Connection:
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -94,6 +95,7 @@ def init_db():
     logger.info("Database initialised at %s", DB_PATH)
 
 # ---------- Снимки трафика ----------
+
 
 def batch_record_traffic(records: List[Tuple]):
     """Each tuple: (panel_name, email, upload, download, total_bytes, expiry_time, record_date)"""
@@ -308,6 +310,7 @@ def save_binding(
     conn.commit()
     conn.close()
 
+
 def _parse_binding_row(row) -> Dict:
     """Преобразует строку из БД в словарь с распарсенным inbound_ids."""
     d = dict(row)
@@ -363,6 +366,7 @@ def list_all_bindings() -> List[Dict]:
     return [_parse_binding_row(r) for r in rows]
 
 # ---------- Лог уведомлений о сроке подписки ----------
+
 
 def has_recent_notification(
     tg_id: int,
@@ -434,7 +438,6 @@ def update_binding_expiry(tg_id: int, panel_name: str, email: str,
     )
     conn.commit()
     conn.close()
-
 
 
 def list_all_bindings_with_users() -> List[Dict]:

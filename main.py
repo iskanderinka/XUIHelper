@@ -1,3 +1,4 @@
+import html
 import logging
 import uuid as uuid_module
 from functools import wraps
@@ -19,6 +20,7 @@ from telegram.ext import (
 )
 
 import config
+from xui_api import XUIApi
 from database import (
     init_db, upsert_bot_user, is_bot_user,
     save_binding, get_user_bindings, get_binding_by_email,
@@ -32,8 +34,9 @@ from helpers import (
     _get_panel_api, _check_panel_available,
     _find_bindings_for_admin,
     _days_to_expiry, _parse_expiry_input, _days_between, _parse_extend_argument,
-    _client_reply_keyboard, _ask_confirm,
+    _client_reply_keyboard, _admin_reply_keyboard, _ask_confirm,
     _render_binding_line, _send_client_notice, _edit_query_safely,
+    _admin_action_keyboard, _render_admin_action_page,
 )
 from jobs import (
     record_traffic_job, daily_report_job,
@@ -150,8 +153,7 @@ def superadmin_only(func):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
 
-    # Защита от двойного /start (Telegram на iOS может прислать /start
-    # автоматически при открытии чата + второй раз от пользователя).
+    # Защита от двойного /start (iOS)
     now = datetime.now()
     last = _last_start_time.get(user.id)
     if last and (now - last).total_seconds() < 2:
@@ -164,14 +166,32 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Не удалось записать bot_user {user.id}: {e}")
 
+    # Админ — своя ветка
+    if config.is_admin(user.id):
+        await update.message.reply_html(
+            rf"Привет, {user.mention_html()}! "
+            f"Твой Telegram ID: <code>{user.id}</code>\n\n"
+            f"Ты администратор. Используй /help для списка команд."
+        )
+        await update.message.reply_text(
+            "👇 Быстрый доступ:",
+            reply_markup=_admin_reply_keyboard(),
+        )
+        return
+
+    # Клиент / неавторизованный — приветствие с inline-кнопкой "Отправить заявку"
+    apply_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Отправить заявку", callback_data="apply:submit")]
+    ])
     await update.message.reply_html(
         rf"Привет, {user.mention_html()}! "
         f"Твой Telegram ID: <code>{user.id}</code>\n\n"
         f"Если ты клиент — админ выдаст тебе подписку, и она придёт в этот чат автоматически.\n"
         f"Используй /help для списка команд.",
+        reply_markup=apply_kb,
     )
 
-    # Если у клиента есть подписка — покажем reply-клавиатуру
+    # Если у клиента уже есть подписка — покажем reply-клавиатуру
     try:
         bindings = get_user_bindings(user.id)
         if bindings:
@@ -183,48 +203,246 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error(f"Не удалось показать клавиатуру {user.id}: {e}")
 
 
+async def apply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка кнопки «Отправить заявку» в приветствии."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    full_name = user.full_name or "—"
+    username = f"@{user.username}" if user.username else "—"
+    user_id = user.id
+
+    # Убираем кнопку, приветствие остаётся
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Не удалось убрать inline-кнопку: {e}")
+
+    # Уведомляем всех админов
+    notif = (
+        f"🆕 <b>Новая заявка</b> 🆕\n\n"
+        f"👤 {html.escape(full_name)}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"🐶 <code>{html.escape(username)}</code>\n\n"
+        f"<i>Важно: создавай клиента лишь тем, кто прошёл через тебя. "
+        f"Все заявки, которые ты не ждёшь, игнорируй!</i>"
+    )
+    for uid in config.get_admin_users():
+        try:
+            await context.bot.send_message(chat_id=uid, text=notif, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Не удалось уведомить админа {uid}: {e}")
+
+
+# ---------- Reply-кнопки админской клавиатуры ----------
+
+async def btn_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «➕ Добавить пользователя» — подсказка по /addclient."""
+    await update.message.reply_text(
+        "➕ **Чтобы добавить клиента**, введи команду:\n\n"
+        "`/addclient <tg_id> <email> <панель> <id1> [id2] ...`\n\n"
+        "**Пример:**\n"
+        "`/addclient 123456789 ivan TMT 8 9`\n\n"
+        "Список панелей: `/listpanels`\n"
+        "Список инбаундов: `/inbounds TMT`",
+        parse_mode='Markdown',
+    )
+
+
+async def _open_admin_action_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> None:
+    """Открывает список клиентов для админского действия."""
+    bindings = list_all_bindings_with_users()
+    if not bindings:
+        await update.message.reply_text("Пока нет ни одного выданного клиента.")
+        return
+
+    text, keyboard = _render_admin_action_page(bindings, action, 0)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
+
+
+async def btn_admin_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «⏸️ Пауза» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "pause")
+
+
+async def btn_admin_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «▶️ Продолжить» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "resume")
+
+
+async def btn_admin_extend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «📅 Продлить» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "extend")
+
+
+async def btn_admin_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🗑️ Удалить» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "revoke")
+
+
+async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка навигации и выбора в админском списке клиентов."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    parts = data.split(":")
+
+    # admact:cancel — удаляем сообщение со списком
+    if data == "admact:cancel":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    # admact:page:<action>:<page> — навигация
+    if len(parts) == 4 and parts[1] == "page":
+        action = parts[2]
+        try:
+            page = int(parts[3])
+        except ValueError:
+            return
+        bindings = list_all_bindings_with_users()
+        if not bindings:
+            await query.edit_message_text("Пока нет ни одного выданного клиента.")
+            return
+        text, keyboard = _render_admin_action_page(bindings, action, page)
+        try:
+            await query.edit_message_text(text, parse_mode='Markdown', reply_markup=keyboard)
+        except Exception as e:
+            logger.debug(f"edit_message_text: {e}")
+        return
+
+    # admact:sel:<action>:<tg_id>:<panel> — выбор клиента
+    if len(parts) == 5 and parts[1] == "sel":
+        action = parts[2]
+        try:
+            tg_id = int(parts[3])
+        except ValueError:
+            return
+        panel_name = parts[4]
+
+        bindings = _find_bindings_for_admin(tg_id)
+        bindings = [b for b in bindings if b["panel_name"] == panel_name]
+        if not bindings:
+            await query.edit_message_text(
+                "Клиент не найден. Возможно, данные изменились."
+            )
+            return
+
+        b = bindings[0]
+        email = b["email"]
+
+        if action == "pause":
+            status = "уже на паузе" if b.get("paused_at") else "будет приостановлена"
+            preview = (
+                f"Поставить на паузу клиента `{tg_id}`:\n\n"
+                f"Подписка `{email}` — {status}"
+            )
+            await _ask_confirm(
+                query.message.chat_id, context, "pause",
+                {"tg_id": tg_id, "bindings": bindings}, preview,
+            )
+
+        elif action == "resume":
+            line = (
+                f"Подписка `{email}` — будет возобновлена"
+                if b.get("paused_at") else
+                f"Подписка `{email}` — не на паузе"
+            )
+            preview = f"Возобновить подписку клиента `{tg_id}`:\n\n{line}"
+            await _ask_confirm(
+                query.message.chat_id, context, "resume",
+                {"tg_id": tg_id, "bindings": bindings}, preview,
+            )
+
+        elif action == "extend":
+            old = b.get("expiry_date") or "бессрочно"
+            await query.edit_message_text(
+                f"📅 **Продлить подписку**\n\n"
+                f"Клиент: `{tg_id}`, подписка `{email}` (сейчас: {old})\n\n"
+                f"Отправь в чат команду:\n"
+                f"`/extendsub {tg_id} +30 {email}`\n\n"
+                f"Или с конкретной датой:\n"
+                f"`/extendsub {tg_id} 2027-01-01 {email}`",
+                parse_mode='Markdown',
+            )
+
+        elif action == "revoke":
+            preview_lines = [f"**Удалить клиента** `{tg_id}`:\n"]
+            for bb in bindings:
+                preview_lines.append(f"Подписка `{bb['email']}`")
+            preview_lines.append("\n⚠️ Клиент будет **удалён из панели** и БД.")
+            preview = "\n".join(preview_lines)
+            await _ask_confirm(
+                query.message.chat_id, context, "revoke",
+                {"tg_id": tg_id, "bindings": bindings}, preview,
+            )
+
+        else:
+            await query.edit_message_text(f"❓ Неизвестное действие: {action}")
+        return
+
+    logger.warning(f"Неизвестный admin_action callback: {data}")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    policy_line = "/policy - 🔒 Политика конфиденциальности\n" if config.get_policy_url() else ""
+    policy_line = "`/policy` - 🔒 Политика конфиденциальности\n" if config.get_policy_url() else ""
     user_id = update.effective_user.id
 
     if config.is_admin(user_id):
-        # Общие админские команды
         common = (
             "**✨ Команды администратора:**\n"
-            "/start - 🚀 Начать работу с ботом\n"
-            "/help - ℹ️ Показать эту справку\n"
+            "`/start` - 🚀 Начать работу с ботом\n"
+            "`/help` - ℹ️ Показать эту справку\n"
             f"{policy_line}"
-            "/listpanels - 📋 Список панелей со статусом\n"
-            "/status <панель> - 📊 Подробный статус панели\n"
-            "/inbounds <панель> - 📡 Список инбаундов с ID\n"
-            "/addclient <tg_id> <email> <панель> <id1> [id2] ... - 🆕 Создать клиента\n"
-            "/revoke <tg_id> [email] - 🗑️ Удалить клиента\n"
-            "/pausesub <tg_id> [email] - ⏸️ Приостановить подписку\n"
-            "/resumesub <tg_id> [email] - ▶️ Возобновить подписку\n"
-            "/extendsub <tg_id> <+N | дата> [email] - 📅 Продлить подписку\n"
-            "/listclients - 📋 Список выданных клиентов\n"
-            "/getlink <tg_id> [email] - 🔗 Получить sub-ссылку клиента\n"
-            "/report - 📈 Отправить дневной отчёт сейчас"
+            "`/guideadmin` - 📚 Гайд для администратора\n"
+            "`/listpanels` - 📋 Список панелей со статусом\n"
+            "`/status <панель>` - 📊 Подробный статус панели\n"
+            "`/inbounds <панель>` - 📡 Список инбаундов с ID\n"
+            "`/addclient <tg_id> <email> <панель> <id1> [id2] ...` - 🆕 Создать клиента\n"
+            "`/revoke <tg_id> [email]` - 🗑️ Удалить клиента\n"
+            "`/pausesub <tg_id> [email]` - ⏸️ Приостановить подписку\n"
+            "`/resumesub <tg_id> [email]` - ▶️ Возобновить подписку\n"
+            "`/extendsub <tg_id> <+N | дата> [email]` - 📅 Продлить подписку\n"
+            "`/listclients` - 📋 Список выданных клиентов\n"
+            "`/getlink <tg_id> [email]` - 🔗 Получить sub-ссылку клиента\n"
+            "`/report` - 📈 Отправить дневной отчёт сейчас"
         )
 
-        # Если это суперадмин — добавим критичные команды
         if config.is_superadmin(user_id):
             common += (
                 "\n\n**🔐 Только суперадмин:**\n"
-                "/setting - ⚙️ Добавить или обновить панель\n"
-                "/delpanel <имя> - 🗑️ Удалить панель"
+                "`/guidesuper` - 📚 Гайд для суперадминистратора\n"
+                "`/setting` - ⚙️ Добавить или обновить панель\n"
+                "`/delpanel <имя>` - 🗑️ Удалить панель"
             )
 
         help_text = common
     else:
         help_text = (
             "**👋 Команды пользователя:**\n"
-            "/start - 🚀 Начать работу с ботом\n"
-            "/help - ℹ️ Показать эту справку\n"
+            "`/start` - 🚀 Начать работу с ботом\n"
+            "`/help` - ℹ️ Показать эту справку\n"
             f"{policy_line}"
-            "/mylink - 🔗 Получить ссылку подписки"
+            "`/guide` - 📚 Гайд по боту\n"
+            "`/mylink` - 🔗 Получить ссылку подписки"
         )
+
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    # Если пользователь — админ, дополнительно показываем клавиатуру
+    if config.is_admin(user_id):
+        await update.message.reply_text(
+            "👇 Быстрый доступ:",
+            reply_markup=_admin_reply_keyboard(),
+        )
 
 
 # --- Админские команды по панелям ---
@@ -361,6 +579,7 @@ async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
+
 @superadmin_only
 async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -371,7 +590,6 @@ async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"🗑️ Панель '{panel_name}' успешно удалена.")
     else:
         await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
-
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -422,6 +640,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         await query.edit_message_text(f"❓ Неизвестное действие: {action}")
 
+
 async def clients_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Навигация по страницам /listclients и удаление сообщения по «Готово»."""
     query = update.callback_query
@@ -468,6 +687,7 @@ async def clients_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # Telegram падает, если текст не изменился (нажали на ту же страницу)
         logger.debug(f"edit_message_text: {e}")
 
+
 def _expiry_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура выбора срока подписки."""
     return InlineKeyboardMarkup([
@@ -497,6 +717,7 @@ async def _ask_expiry(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode='Markdown',
         reply_markup=_expiry_keyboard(),
     )
+
 
 async def _ask_comment(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Задаёт вопрос о комментарии к клиенту."""
@@ -731,6 +952,7 @@ async def addclient_expiry_skip(update: Update, context: ContextTypes.DEFAULT_TY
     await _ask_comment(update.effective_chat.id, context)
     return AC_COMMENT
 
+
 async def addclient_comment_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка текстового ввода комментария."""
     text = update.message.text.strip()
@@ -799,6 +1021,8 @@ async def addclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 # --- /pausesub ---
+
+
 @admin_only
 async def pausesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на постановку подписки на паузу."""
@@ -884,6 +1108,8 @@ async def _do_pause(update, context, payload, query) -> None:
         )
 
 # --- /resumesub ---
+
+
 @admin_only
 async def resumesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на возобновление подписки."""
@@ -1125,6 +1351,8 @@ async def _do_extend(update, context, payload, query) -> None:
             logger.warning(f"Не удалось уведомить клиента {tg_id} о продлении: {e}")
 
 # --- /revoke и /listclients ---
+
+
 @admin_only
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на удаление клиента."""
@@ -1193,6 +1421,8 @@ async def _do_revoke(update, context, payload, query) -> None:
     await _edit_query_safely(query, "\n".join(lines))
 
 # --- /getlink ---
+
+
 @admin_only
 async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Выдаёт sub-ссылку клиента админу по запросу."""
@@ -1251,6 +1481,7 @@ async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
 
 async def _do_addclient(update, context, payload, query) -> None:
     """Выполняет создание клиента после подтверждения."""
@@ -1361,6 +1592,8 @@ async def _do_addclient(update, context, payload, query) -> None:
     await query.edit_message_text(admin_msg, parse_mode='Markdown')
 
 CLIENTS_PAGE_SIZE = 5
+
+
 def _format_client_binding(b: dict) -> str:
     """Форматирует одну связку клиента для /listclients."""
     username = b.get("bot_username")
@@ -1477,6 +1710,51 @@ async def policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.warning(f"Markdown для /policy не сработал: {e}. Отправляю как plain text.")
         await update.message.reply_text(message, reply_markup=keyboard)
+
+
+# ---------- Гайды ----------
+
+async def _send_guide(update: Update, role: str) -> None:
+    """Отправляет сообщение гайда с inline-кнопкой, если URL задан."""
+    url = config.get_guide_url(role)
+    message = config.get_guide_message(role)
+
+    keyboard = None
+    if url:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 Читать полностью", url=url)]
+        ])
+
+    try:
+        await update.message.reply_text(
+            message, parse_mode='Markdown', reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.warning(f"Markdown для гайда '{role}' не сработал: {e}. Отправляю как plain text.")
+        await update.message.reply_text(message, reply_markup=keyboard)
+
+
+async def guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Гайд для клиента (доступен всем)."""
+    await _send_guide(update, "client")
+
+
+async def guide_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Гайд для администратора."""
+    if not config.is_admin(update.effective_user.id):
+        await update.message.reply_text("Извините, эта команда доступна только администраторам.")
+        return
+    await _send_guide(update, "admin")
+
+
+async def guide_super_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Гайд для суперадминистратора."""
+    if not config.is_superadmin(update.effective_user.id):
+        await update.message.reply_text(
+            "Извините, эта команда доступна только главному администратору."
+        )
+        return
+    await _send_guide(update, "superadmin")
 
 
 # --- Клиентские команды ---
@@ -1690,7 +1968,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(report_text, parse_mode='Markdown')
 
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Логирует исключения в хендлерах и говорит пользователю, что что-то сломалось."""
     logger.error("Исключение при обработке апдейта:", exc_info=context.error)
@@ -1784,6 +2061,8 @@ def main() -> None:
 
     # Callback-подтверждения — регистрируем ДО ConversationHandler
     application.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
+    application.add_handler(CallbackQueryHandler(apply_callback, pattern=r"^apply:submit$"))
+    application.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admact:"))
     application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
 
     application.add_handler(conv_setting)
@@ -1791,6 +2070,9 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("policy", policy_command))
+    application.add_handler(CommandHandler("guide", guide_command))
+    application.add_handler(CommandHandler("guideadmin", guide_admin_command))
+    application.add_handler(CommandHandler("guidesuper", guide_super_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("inbounds", inbounds_command))
     application.add_handler(CommandHandler("mylink", mylink_command))
@@ -1813,8 +2095,25 @@ def main() -> None:
         filters.Regex("^🆘 Нужна помощь$"), btn_help
     ))
 
+    # Reply-кнопки админа
+    application.add_handler(MessageHandler(
+        filters.Regex("^➕ Добавить пользователя$"), btn_admin_add
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex("^⏸️ Пауза$"), btn_admin_pause
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex("^▶️ Продолжить$"), btn_admin_resume
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex("^📅 Продлить$"), btn_admin_extend
+    ))
+    application.add_handler(MessageHandler(
+        filters.Regex("^🗑️ Удалить$"), btn_admin_revoke
+    ))
     logger.info("Бот запущен...")
     application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
