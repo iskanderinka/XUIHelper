@@ -1,5 +1,4 @@
 import html
-import json
 import logging
 import uuid as uuid_module
 from functools import wraps
@@ -21,7 +20,7 @@ from telegram.ext import (
 )
 
 import config
-from xui_api import XUIApi
+from xui_api import XUIApi, _parse_settings
 from database import (
     init_db, upsert_bot_user, is_bot_user,
     save_binding, get_user_bindings, get_binding_by_email,
@@ -1696,8 +1695,6 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except (ValueError, TypeError):
                 continue
             for client in settings.get("clients", []) or []:
-                # uuid — настоящий UUID клиента (совпадает с БД).
-                # id в 3x-ui 3.8.0 — числовой DB-id, не используется как ключ.
                 c_uuid = client.get("uuid") or ""
                 if c_uuid:
                     panel_clients[c_uuid] = {

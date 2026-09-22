@@ -328,17 +328,14 @@ class XUIApi:
         inbounds_data = await self.get_inbounds()
         if inbounds_data and inbounds_data.get("success"):
             for inbound in inbounds_data.get("obj", []) or []:
-                settings_raw = inbound.get("settings", "")
-                if not settings_raw:
-                    continue
-                try:
-                    settings = json.loads(settings_raw)
-                except (ValueError, TypeError):
+                settings = _parse_settings(inbound.get("settings"))
+                if not settings:
                     continue
                 for client in settings.get("clients", []) or []:
                     if client.get("email") == email:
                         return client
         return None
+
 
     # ---- Обновление клиента (enable / expiry / comment) ----
     async def update_client(
@@ -435,3 +432,20 @@ class XUIApi:
         if not self.sub_url:
             return None
         return f"{self.sub_url}/{sub_id}"
+
+
+def _parse_settings(settings_raw) -> Optional[Dict]:
+    """
+    Универсально парсит поле settings инбаунда.
+
+    В 3.x-ui ≤ 2.6.x это JSON-строка.
+    В 3.8.x это уже готовый dict.
+    """
+    if isinstance(settings_raw, dict):
+        return settings_raw
+    if isinstance(settings_raw, str) and settings_raw:
+        try:
+            return json.loads(settings_raw)
+        except (ValueError, TypeError):
+            return None
+    return None
