@@ -451,3 +451,116 @@ def list_all_bindings_with_users() -> List[Dict]:
     ).fetchall()
     conn.close()
     return [_parse_binding_row(r) for r in rows]
+
+
+def update_binding_email(tg_id: int, panel_name: str, old_email: str,
+                          new_email: str) -> bool:
+    """
+    Меняет email в связке.
+
+    Возвращает True при успехе, False если новый email уже занят
+    (нарушение PRIMARY KEY).
+    """
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE client_bindings SET email = ?
+               WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+            (new_email, int(tg_id), panel_name, old_email),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def rename_traffic_email(panel_name: str, old_email: str, new_email: str) -> int:
+    """Переписывает email в traffic_records. Возвращает число обновлённых строк."""
+    conn = _get_conn()
+    cursor = conn.execute(
+        """UPDATE traffic_records SET email = ?
+           WHERE panel_name = ? AND email = ?""",
+        (new_email, panel_name, old_email),
+    )
+    updated = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def update_binding_limit_hwid(tg_id: int, panel_name: str, email: str,
+                               new_limit: int) -> None:
+    """Обновляет HWID-лимит в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET limit_hwid = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (int(new_limit), int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_binding_comment(tg_id: int, panel_name: str, email: str,
+                           comment: str) -> None:
+    """Обновляет комментарий в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET comment = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (comment, int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_binding_limit_hwid(tg_id: int, panel_name: str, email: str,
+                               new_limit: int) -> None:
+    """Обновляет HWID-лимит в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET limit_hwid = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (int(new_limit), int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_binding_email(tg_id: int, panel_name: str, old_email: str,
+                          new_email: str) -> bool:
+    """
+    Меняет email в связке.
+
+    Возвращает True при успехе, False если новый email уже занят
+    (нарушение PRIMARY KEY).
+    """
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE client_bindings SET email = ?
+               WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+            (new_email, int(tg_id), panel_name, old_email),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def rename_traffic_email(panel_name: str, old_email: str, new_email: str) -> int:
+    """Переписывает email в traffic_records. Возвращает число обновлённых строк."""
+    conn = _get_conn()
+    cursor = conn.execute(
+        """UPDATE traffic_records SET email = ?
+           WHERE panel_name = ? AND email = ?""",
+        (new_email, panel_name, old_email),
+    )
+    updated = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated

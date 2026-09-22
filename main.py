@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 import uuid as uuid_module
 from functools import wraps
@@ -24,8 +25,10 @@ from xui_api import XUIApi
 from database import (
     init_db, upsert_bot_user, is_bot_user,
     save_binding, get_user_bindings, get_binding_by_email,
-    delete_binding, list_all_bindings_with_users,
+    delete_binding, list_all_bindings_with_users, list_all_bindings,
     set_binding_paused, update_binding_expiry,
+    update_binding_comment, update_binding_limit_hwid,
+    update_binding_email, rename_traffic_email,
 )
 from helpers import (
     _tz,
@@ -412,8 +415,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`/resumesub <tg_id> [email]` - ▶️ Возобновить подписку\n"
             "`/extendsub <tg_id> <+N | дата> [email]` - 📅 Продлить подписку\n"
             "`/listclients` - 📋 Список выданных клиентов\n"
-            "`/getlink <tg_id> [email]` - 🔗 Получить sub-ссылку клиента\n"
-            "`/report` - 📈 Отправить дневной отчёт сейчас"
+            "/getlink <tg_id> [email] - 🔗 Получить sub-ссылку клиента\n"
+            "/setcomment <tg_id> <email> <текст> - 💬 Изменить комментарий\n"
+            "/rename <tg_id> <старый> <новый> - ✏️ Изменить email клиента\n"
+            "/report - 📈 Отправить дневной отчёт сейчас"
         )
 
         if config.is_superadmin(user_id):
@@ -421,7 +426,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "\n\n**🔐 Только суперадмин:**\n"
                 "`/guidesuper` - 📚 Гайд для суперадминистратора\n"
                 "`/setting` - ⚙️ Добавить или обновить панель\n"
-                "`/delpanel <имя>` - 🗑️ Удалить панель"
+                "`/delpanel <имя>` - 🗑️ Удалить панель\n"
+                "`/sync` - 🔄 Синхронизировать БД с панелью"
             )
 
         help_text = common
@@ -1483,6 +1489,303 @@ async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
+# ---------- /setcomment ----------
+@admin_only
+async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Меняет комментарий клиента — и в БД, и в панели."""
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Формат: /setcomment <tg_id> <email> <новый комментарий>\n\n"
+            "Пустой комментарий — используй `-` вместо текста.",
+            parse_mode='Markdown',
+        )
+        return
+
+    try:
+        tg_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("TG ID должен быть числом.")
+        return
+
+    email = context.args[1].strip()
+    raw_comment = " ".join(context.args[2:]).strip()
+    new_comment = "" if raw_comment == "-" else raw_comment
+
+    bindings = _find_bindings_for_admin(tg_id, email)
+    if not bindings:
+        await update.message.reply_text(
+            f"Связка `{email}` у клиента {tg_id} не найдена.",
+            parse_mode='Markdown',
+        )
+        return
+
+    b = bindings[0]
+    panel_name = b["panel_name"]
+
+    err = _check_panel_available(panel_name)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    result = None
+    try:
+        async with _get_panel_api(panel_name) as api:
+            await api.login()
+            result = await api.update_client(email, comment=new_comment)
+    except Exception as e:
+        logger.error(f"[admin={update.effective_user.id}] Ошибка setcomment '{panel_name}/{email}': {e}")
+
+    if result is True:
+        try:
+            update_binding_comment(tg_id, panel_name, email, new_comment)
+        except Exception as e:
+            logger.error(f"Не удалось обновить комментарий в БД: {e}")
+        shown = f"`{new_comment}`" if new_comment else "*(пустой)*"
+        await update.message.reply_text(
+            f"✅ Комментарий обновлён.\n\n"
+            f"Панель: `{panel_name}`\n"
+            f"Клиент: `{email}`\n"
+            f"Комментарий: {shown}",
+            parse_mode='Markdown',
+        )
+    elif result is False:
+        await update.message.reply_text("❌ Клиента нет в панели.")
+    else:
+        await update.message.reply_text("❌ Ошибка связи с панелью.")
+
+
+# ---------- /rename ----------
+@admin_only
+async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Меняет email клиента — и в БД, и в панели, и в истории трафика."""
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Формат: /rename <tg_id> <старый_email> <новый_email>"
+        )
+        return
+
+    try:
+        tg_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("TG ID должен быть числом.")
+        return
+
+    old_email = context.args[1].strip()
+    new_email = context.args[2].strip()
+
+    err = _validate_email(new_email)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    bindings = _find_bindings_for_admin(tg_id, old_email)
+    if not bindings:
+        await update.message.reply_text(
+            f"Связка `{old_email}` у клиента {tg_id} не найдена.",
+            parse_mode='Markdown',
+        )
+        return
+
+    b = bindings[0]
+    panel_name = b["panel_name"]
+
+    err = _check_panel_available(panel_name)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    # Проверка в БД
+    if get_binding_by_email(panel_name, new_email):
+        await update.message.reply_text(
+            f"❌ Клиент с email `{new_email}` уже существует в БД на '{panel_name}'.",
+            parse_mode='Markdown',
+        )
+        return
+
+    # Проверка в панели + смена email
+    result = None
+    try:
+        async with _get_panel_api(panel_name) as api:
+            await api.login()
+            existing = await api.get_client_object(new_email)
+            if existing is not None:
+                await update.message.reply_text(
+                    f"❌ Клиент с email `{new_email}` уже есть в панели.",
+                    parse_mode='Markdown',
+                )
+                return
+            result = await api.update_client(old_email, email=new_email)
+    except Exception as e:
+        logger.error(f"[admin={update.effective_user.id}] Ошибка rename '{panel_name}': {e}")
+
+    if result is not True:
+        if result is False:
+            await update.message.reply_text(
+                f"❌ Клиента `{old_email}` нет в панели.",
+                parse_mode='Markdown',
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка связи с панелью.")
+        return
+
+    # Обновляем БД
+    db_ok = update_binding_email(tg_id, panel_name, old_email, new_email)
+    if not db_ok:
+        logger.error(f"БД: не удалось переименовать {old_email} -> {new_email}")
+        await update.message.reply_text(
+            "⚠️ Панель обновлена, но в БД ошибка.\nЗапусти `/sync` для восстановления.",
+            parse_mode='Markdown',
+        )
+        return
+
+    renamed = rename_traffic_email(panel_name, old_email, new_email)
+
+    await update.message.reply_text(
+        f"✅ **Email изменён**\n\n"
+        f"Было: `{old_email}`\n"
+        f"Стало: `{new_email}`\n"
+        f"Панель: `{panel_name}`\n"
+        f"Записей трафика обновлено: {renamed}",
+        parse_mode='Markdown',
+    )
+
+
+# ---------- /sync ----------
+@superadmin_only
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Синхронизирует БД из панели: email, комментарий, HWID, срок действия."""
+    await update.message.reply_text("🔄 Запускаю синхронизацию. Это займёт несколько секунд...")
+
+    all_panels = config.get_all_panels()
+    if not all_panels:
+        await update.message.reply_text("Панели не настроены.")
+        return
+
+    total_updated = 0
+    total_renamed = 0
+    total_missing = 0
+    lines = []
+
+    for panel_name, pconf in all_panels.items():
+        if pconf.get("disabled", False):
+            lines.append(f"⏭️ **{panel_name}**: отключена")
+            continue
+
+        # 1. Все клиенты панели
+        try:
+            async with _get_panel_api(panel_name) as api:
+                await api.login()
+                inbounds_data = await api.get_inbounds()
+        except Exception as e:
+            logger.error(f"[sync] Ошибка '{panel_name}': {e}")
+            lines.append(f"❌ **{panel_name}**: ошибка связи")
+            continue
+
+        if not inbounds_data or not inbounds_data.get("success"):
+            lines.append(f"❌ **{panel_name}**: не удалось получить данные")
+            continue
+
+        # 2. Карта UUID → {email, comment, limitHwid, expiryTime}
+        panel_clients = {}
+        for inbound in inbounds_data.get("obj", []):
+            settings_raw = inbound.get("settings", "")
+            if not settings_raw:
+                continue
+            try:
+                settings = json.loads(settings_raw)
+            except (ValueError, TypeError):
+                continue
+            for client in settings.get("clients", []) or []:
+                c_uuid = client.get("id") or client.get("uuid") or ""
+                if c_uuid:
+                    panel_clients[c_uuid] = {
+                        "email": client.get("email") or "",
+                        "comment": client.get("comment") or "",
+                        "limitHwid": int(client.get("limitHwid") or 0),
+                        "expiryTime": int(client.get("expiryTime") or 0),
+                    }
+
+        # 3. Обходим связки панели
+        panel_bindings = [b for b in list_all_bindings() if b["panel_name"] == panel_name]
+
+        panel_upd = 0
+        panel_ren = 0
+        panel_miss = 0
+
+        for b in panel_bindings:
+            b_uuid = b.get("uuid") or ""
+            if not b_uuid or b_uuid not in panel_clients:
+                panel_miss += 1
+                continue
+
+            pc = panel_clients[b_uuid]
+            old_email = b["email"]
+            new_email = pc["email"]
+
+            # 3.1. Смена email
+            if new_email and new_email != old_email:
+                db_ok = update_binding_email(b["tg_id"], panel_name, old_email, new_email)
+                if db_ok:
+                    renamed = rename_traffic_email(panel_name, old_email, new_email)
+                    logger.info(
+                        f"[sync] {panel_name}: '{old_email}' -> '{new_email}' "
+                        f"({renamed} записей трафика)"
+                    )
+                    panel_ren += 1
+                    total_renamed += 1
+                else:
+                    logger.warning(f"[sync] Не удалось переименовать {old_email} -> {new_email}")
+
+            # Для дальнейших проверок используем актуальный email
+            current_email = new_email or old_email
+
+            # 3.2. Комментарий
+            if pc["comment"] != (b.get("comment") or ""):
+                try:
+                    update_binding_comment(b["tg_id"], panel_name, current_email, pc["comment"])
+                    panel_upd += 1
+                except Exception as e:
+                    logger.error(f"[sync] Ошибка обновления комментария: {e}")
+
+            # 3.3. HWID
+            if pc["limitHwid"] != (b.get("limit_hwid") or 0):
+                try:
+                    update_binding_limit_hwid(b["tg_id"], panel_name, current_email, pc["limitHwid"])
+                    panel_upd += 1
+                except Exception as e:
+                    logger.error(f"[sync] Ошибка обновления HWID: {e}")
+
+            # 3.4. Срок
+            new_expiry = None
+            if pc["expiryTime"] > 0:
+                try:
+                    new_expiry = datetime.fromtimestamp(
+                        pc["expiryTime"] / 1000, _tz()
+                    ).strftime("%Y-%m-%d")
+                except (ValueError, OSError):
+                    new_expiry = None
+            if (new_expiry or "") != (b.get("expiry_date") or ""):
+                try:
+                    update_binding_expiry(b["tg_id"], panel_name, current_email, new_expiry)
+                    panel_upd += 1
+                except Exception as e:
+                    logger.error(f"[sync] Ошибка обновления expiry: {e}")
+
+        total_updated += panel_upd
+        total_missing += panel_miss
+
+        lines.append(
+            f"✅ **{panel_name}**: обновлено {panel_upd}, "
+            f"переименовано {panel_ren}, потеряно {panel_miss}"
+        )
+
+    lines.append(
+        f"\n**Итого:** обновлено {total_updated}, "
+        f"переименовано {total_renamed}, не найдено в панели {total_missing}"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
 async def _do_addclient(update, context, payload, query) -> None:
     """Выполняет создание клиента после подтверждения."""
     panel_name = payload["panel_name"]
@@ -1550,6 +1853,10 @@ async def _do_addclient(update, context, payload, query) -> None:
         f"Срок действия: до **{expiry_date_str}**"
         if expiry_date_str else "Срок действия: **бессрочно**"
     )
+    # Админам не перезаписываем клавиатуру — они получают подписку,
+    # но клавиатура остаётся админская. Ссылку берут через /mylink.
+    keyboard = None if config.is_admin(tg_id) else _client_reply_keyboard()
+
     delivered = True
     try:
         await context.bot.send_message(
@@ -1564,7 +1871,7 @@ async def _do_addclient(update, context, payload, query) -> None:
                 f"Чтобы скопировать, удерживай палец на ссылке."
             ),
             parse_mode='Markdown',
-            reply_markup=_client_reply_keyboard(),
+            reply_markup=keyboard,
         )
     except Exception as e:
         delivered = False
@@ -2079,6 +2386,9 @@ def main() -> None:
     application.add_handler(CommandHandler("revoke", revoke_command))
     application.add_handler(CommandHandler("listclients", listclients_command))
     application.add_handler(CommandHandler("getlink", getlink_command))
+    application.add_handler(CommandHandler("setcomment", setcomment_command))
+    application.add_handler(CommandHandler("rename", rename_command))
+    application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(CommandHandler("pausesub", pausesub_command))
     application.add_handler(CommandHandler("resumesub", resumesub_command))
     application.add_handler(CommandHandler("extendsub", extendsub_command))
