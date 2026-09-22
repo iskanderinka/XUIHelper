@@ -1696,7 +1696,9 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except (ValueError, TypeError):
                 continue
             for client in settings.get("clients", []) or []:
-                c_uuid = client.get("id") or client.get("uuid") or ""
+                # uuid — настоящий UUID клиента (совпадает с БД).
+                # id в 3x-ui 3.8.0 — числовой DB-id, не используется как ключ.
+                c_uuid = client.get("uuid") or ""
                 if c_uuid:
                     panel_clients[c_uuid] = {
                         "email": client.get("email") or "",
@@ -1716,6 +1718,10 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             b_uuid = b.get("uuid") or ""
             if not b_uuid or b_uuid not in panel_clients:
                 panel_miss += 1
+                logger.warning(
+                    f"[sync] {panel_name}: потеряна связка "
+                    f"tg_id={b['tg_id']}, email={b['email']}, uuid={b_uuid or '(пусто)'}"
+                )
                 continue
 
             pc = panel_clients[b_uuid]
