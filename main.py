@@ -1614,7 +1614,7 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     parse_mode='Markdown',
                 )
                 return
-            result = await api.update_client(old_email, email=new_email)
+            result = await api.update_client(old_email, new_email=new_email)
     except Exception as e:
         logger.error(f"[admin={update.effective_user.id}] Ошибка rename '{panel_name}': {e}")
 

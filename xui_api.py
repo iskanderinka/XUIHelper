@@ -341,19 +341,23 @@ class XUIApi:
         return None
 
     # ---- Обновление клиента (enable / expiry / comment) ----
-
-    async def update_client(self, email: str, **changes) -> Optional[bool]:
+    async def update_client(
+        self,
+        email: str,
+        new_email: Optional[str] = None,
+        **changes,
+    ) -> Optional[bool]:
         """
         Обновляет поля клиента в панели.
+
+        :param email: текущий email клиента (для поиска в панели).
+        :param new_email: если задан — переименовать клиента в этот email.
+        :param changes: остальные поля для изменения (comment, enable, expiryTime, ...).
 
         Возвращает:
           True  — успех
           False — клиента нет в панели
           None  — ошибка сессии, сети или API
-
-        Собирает payload вручную из известных полей — ровно тех,
-        что отправляет UI 3.8.0. Лишние поля из GET (allowedIPs,
-        clientStats, up, down и т.п.) не передаём: панель на них падает.
         """
         if not await self._ensure_session():
             return None
@@ -399,6 +403,11 @@ class XUIApi:
             "trafficResetDay": _to_int(client.get("trafficResetDay"), 1),
         }
 
+        # Переименование (если запрошено)
+        if new_email is not None:
+            payload["email"] = new_email
+
+        # Прочие изменения
         for key, value in changes.items():
             payload[key] = value
 
