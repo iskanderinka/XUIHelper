@@ -291,7 +291,6 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Обработка навигации и выбора в админском списке клиентов."""
     query = update.callback_query
     await query.answer()
-
     data = query.data or ""
     parts = data.split(":")
 
@@ -429,12 +428,12 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     logger.warning(f"Неизвестный admin_action callback: {data}")
 
 
-async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[bool]:
     """Ловит текст, когда админ вводит новый email или комментарий после кнопки."""
     pending = context.user_data.get("pending_input")
     if not pending:
-        # Нет ожидающего ввода — игнорируем. Не отвечаем, чтобы не мешать другим хендлерам.
-        return
+        # Нет ожидающего ввода — пропускаем апдейт дальше по цепочке
+        return False
 
     text = (update.message.text or "").strip()
     action = pending["action"]
@@ -2037,6 +2036,8 @@ async def _do_addclient(update, context, payload, query) -> None:
         f"Möhlet: **{expiry_date_str}** çenli"
         if expiry_date_str else "Möhlet: **möhletsiz**"
     )
+    # Админам не перезаписываем клавиатуру
+    keyboard = None if config.is_admin(tg_id) else _client_reply_keyboard()
     delivered = True
     try:
         await context.bot.send_message(
@@ -2048,7 +2049,7 @@ async def _do_addclient(update, context, payload, query) -> None:
                 f"{expiry_line_client}\n\n"
                 f"**Abuna salgysy:**\n{sub_link}\n\n"
                 f"Salgyny bas — brauzer açylar. "
-                f"Göçürmek üçin, barmagyňy salgynyň üstünde sakla."
+                f"Göçürmek üçin, barmagyňy salgynyň üstündäki sakla."
             ),
             parse_mode='Markdown',
             reply_markup=keyboard,
@@ -2552,8 +2553,23 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admact:"))
     application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
 
+    # cancel_input — обычная команда, группа 0
+    application.add_handler(CommandHandler("cancel_input", cancel_input_command))
+
+    # pending_input_handler — в группе 1.
+    # Вызывается ТОЛЬКО если группа 0 не обработала апдейт.
+    # Все кнопки и команды обрабатываются в группе 0, сюда не доходят.
+    # А вот текстовый ввод (после выбора клиента) никем в группе 0 не перехватывается
+    # и попадает сюда.
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, pending_input_handler),
+        group=1,
+    )
+
+    # ConversationHandler-ы — ПОСЛЕ pending_input_handler
     application.add_handler(conv_setting)
     application.add_handler(conv_addclient)
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("policy", policy_command))
@@ -2575,6 +2591,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delpanel", delpanel_command))
     application.add_handler(CommandHandler("listpanels", listpanels_command))
     application.add_handler(CommandHandler("report", report_command))
+
     application.add_handler(MessageHandler(
         filters.Regex("^🔗 Abuna salgysy$"), btn_my_link
     ))
@@ -2601,12 +2618,11 @@ def main() -> None:
     application.add_handler(MessageHandler(
         filters.Regex("^🗑️ Удалить$"), btn_admin_revoke
     ))
+
     logger.info("Бот запущен...")
     application.run_polling(drop_pending_updates=True)
-    application.add_handler(CommandHandler("cancel_input", cancel_input_command))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, pending_input_handler
-    ))
+    logger.info("Бот запущен...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
