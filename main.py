@@ -415,10 +415,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`/resumesub <tg_id> [email]` - ▶️ Возобновить подписку\n"
             "`/extendsub <tg_id> <+N | дата> [email]` - 📅 Продлить подписку\n"
             "`/listclients` - 📋 Список выданных клиентов\n"
-            "/getlink <tg_id> [email] - 🔗 Получить sub-ссылку клиента\n"
-            "/setcomment <tg_id> <email> <текст> - 💬 Изменить комментарий\n"
-            "/rename <tg_id> <старый> <новый> - ✏️ Изменить email клиента\n"
-            "/report - 📈 Отправить дневной отчёт сейчас"
+            "`/getlink <tg_id> [email]` - 🔗 Получить sub-ссылку клиента\n"
+            "`/setcomment <tg_id> <email> <текст>` - 💬 Изменить комментарий\n"
+            "`/rename <tg_id> <старый> <новый>` - ✏️ Изменить email клиента\n"
+            "`/report` - 📈 Отправить дневной отчёт сейчас"
         )
 
         if config.is_superadmin(user_id):
