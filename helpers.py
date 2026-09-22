@@ -234,13 +234,14 @@ def _client_reply_keyboard() -> ReplyKeyboardMarkup:
     """
     Reply-клавиатура для клиента с активной подпиской.
 
+    Тексты кнопок — на туркменском (целевая аудитория).
     Остаётся в чате навсегда, пока бот не пришлёт новую или не уберёт.
     """
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🔗 Ссылка подписки")],
-            [KeyboardButton("📊 Тарифы")],
-            [KeyboardButton("🆘 Нужна помощь")],
+            [KeyboardButton("🔗 Abuna salgysy")],
+            [KeyboardButton("📊 Nyrhlar")],
+            [KeyboardButton("🆘 Kömek gerek")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -256,7 +257,7 @@ def _admin_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("➕ Добавить пользователя")],
-            [KeyboardButton("⏸️ Пауза"), KeyboardButton("▶️ Продолжить")],
+            [KeyboardButton("✏️ Переименовать"), KeyboardButton("💬 Комментарий")],
             [KeyboardButton("📅 Продлить"), KeyboardButton("🗑️ Удалить")],
         ],
         resize_keyboard=True,
@@ -334,10 +335,10 @@ async def _edit_query_safely(query, text: str) -> None:
 # ---------- Inline-клавиатура выбора клиента для админских действий ----------
 
 _ADMIN_ACTION_TITLES = {
-    "pause": "⏸️ Пауза — выбери клиента",
-    "resume": "▶️ Продолжить — выбери клиента",
     "extend": "📅 Продлить — выбери клиента",
     "revoke": "🗑️ Удалить — выбери клиента",
+    "rename": "✏️ Переименовать — выбери клиента",
+    "comment": "💬 Комментарий — выбери клиента",
 }
 
 ADMIN_ACTION_PAGE_SIZE = 5

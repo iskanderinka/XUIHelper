@@ -210,10 +210,10 @@ async def _send_client_expiry_notice(
 ) -> None:
     """Отправляет клиенту напоминание о скором истечении подписки."""
     text = (
-        f"⏰ **Напоминание о подписке**\n\n"
-        f"Твоя подписка истекает через **{days_left} дн.** — "
-        f"до **{expiry_str}**.\n\n"
-        f"Позаботься о продлении, чтобы не потерять доступ."
+        f"⏰ **Abuna barada ýatlatma**\n\n"
+        f"Seniň abunaň **{days_left} gün** içinde gutarýar — "
+        f"**{expiry_str}** çenli.\n\n"
+        f"Möhleti wagtynda uzaltmak barada alada et."
     )
     try:
         await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')

@@ -183,13 +183,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Клиент / неавторизованный — приветствие с inline-кнопкой "Отправить заявку"
     apply_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Отправить заявку", callback_data="apply:submit")]
+        [InlineKeyboardButton("📝 Arza ibermek", callback_data="apply:submit")]
     ])
     await update.message.reply_html(
-        rf"Привет, {user.mention_html()}! "
-        f"Твой Telegram ID: <code>{user.id}</code>\n\n"
-        f"Если ты клиент — админ выдаст тебе подписку, и она придёт в этот чат автоматически.\n"
-        f"Используй /help для списка команд.",
+        rf"Salam, {user.mention_html()}! "
+        f"Seniň Telegram ID: <code>{user.id}</code>\n\n"
+        f"Eger sen müşderi bolsaň — administrator saňa abuna berer, ol awtomatik şu çata gelýär.\n"
+        f"Buýruklaryň sanawy üçin /help ulanyp bilersiň.",
         reply_markup=apply_kb,
     )
 
@@ -198,7 +198,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         bindings = get_user_bindings(user.id)
         if bindings:
             await update.message.reply_text(
-                "👇 Кнопки для быстрого доступа к подписке:",
+                "👇 Abuna üçin çalt düwmeler:",
                 reply_markup=_client_reply_keyboard(),
             )
     except Exception as e:
@@ -267,14 +267,14 @@ async def _open_admin_action_list(
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
 
 
-async def btn_admin_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «⏸️ Пауза» — открывает список клиентов."""
-    await _open_admin_action_list(update, context, "pause")
+async def btn_admin_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «✏️ Переименовать» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "rename")
 
 
-async def btn_admin_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «▶️ Продолжить» — открывает список клиентов."""
-    await _open_admin_action_list(update, context, "resume")
+async def btn_admin_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «💬 Комментарий» — открывает список клиентов."""
+    await _open_admin_action_list(update, context, "comment")
 
 
 async def btn_admin_extend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -364,6 +364,41 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 {"tg_id": tg_id, "bindings": bindings}, preview,
             )
 
+        elif action == "rename":
+            context.user_data["pending_input"] = {
+                "action": "rename",
+                "tg_id": tg_id,
+                "panel_name": panel_name,
+                "email": email,
+                "prompt_msg_id": query.message.message_id,
+            }
+            await query.edit_message_text(
+                f"✏️ **Переименовать подписку**\n\n"
+                f"Клиент: `{tg_id}`\n"
+                f"Текущий email: `{email}`\n\n"
+                f"**Введи новый email** в ответ на это сообщение.\n"
+                f"Только латиница, цифры, точка, дефис, подчёркивание.\n\n"
+                f"Отмена: `/cancel_input`",
+                parse_mode='Markdown',
+            )
+
+        elif action == "comment":
+            context.user_data["pending_input"] = {
+                "action": "comment",
+                "tg_id": tg_id,
+                "panel_name": panel_name,
+                "email": email,
+                "prompt_msg_id": query.message.message_id,
+            }
+            await query.edit_message_text(
+                f"💬 **Изменить комментарий**\n\n"
+                f"Клиент: `{tg_id}`, подписка `{email}`\n\n"
+                f"**Введи новый комментарий** в ответ на это сообщение.\n"
+                f"Чтобы очистить — отправь `-`.\n\n"
+                f"Отмена: `/cancel_input`",
+                parse_mode='Markdown',
+            )
+
         elif action == "extend":
             old = b.get("expiry_date") or "бессрочно"
             await query.edit_message_text(
@@ -394,8 +429,157 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     logger.warning(f"Неизвестный admin_action callback: {data}")
 
 
+async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит текст, когда админ вводит новый email или комментарий после кнопки."""
+    pending = context.user_data.get("pending_input")
+    if not pending:
+        # Нет ожидающего ввода — игнорируем. Не отвечаем, чтобы не мешать другим хендлерам.
+        return
+
+    text = (update.message.text or "").strip()
+    action = pending["action"]
+    tg_id = pending["tg_id"]
+    panel_name = pending["panel_name"]
+    old_email = pending["email"]
+    chat_id = update.effective_chat.id
+
+    # Удаляем сообщение с вводом, чтобы не мусорить
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # Удаляем подсказку (тот edit_message_text от admin_action_callback)
+    prompt_msg_id = pending.get("prompt_msg_id")
+    if prompt_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
+        except Exception:
+            pass
+
+    context.user_data.pop("pending_input", None)
+
+    # Проверка панели
+    err = _check_panel_available(panel_name)
+    if err:
+        await context.bot.send_message(chat_id=chat_id, text=err)
+        return
+
+    if action == "rename":
+        err = _validate_email(text)
+        if err:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ {err}\nНачни заново через кнопку «✏️ Переименовать».")
+            return
+        new_email = text
+
+        if get_binding_by_email(panel_name, new_email):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Email `{new_email}` уже занят в БД на '{panel_name}'.",
+                parse_mode='Markdown',
+            )
+            return
+
+        result = None
+        try:
+            async with _get_panel_api(panel_name) as api:
+                await api.login()
+                existing = await api.get_client_object(new_email)
+                if existing is not None:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Клиент с email `{new_email}` уже есть в панели.",
+                        parse_mode='Markdown',
+                    )
+                    return
+                result = await api.update_client(old_email, new_email=new_email)
+        except Exception as e:
+            logger.error(f"[admin={update.effective_user.id}] Ошибка rename '{panel_name}': {e}")
+
+        if result is not True:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Не удалось переименовать.\n"
+                    f"Возможно, клиента `{old_email}` нет в панели.\n"
+                    f"Проверь через `/sync`."
+                ),
+                parse_mode='Markdown',
+            )
+            return
+
+        db_ok = update_binding_email(tg_id, panel_name, old_email, new_email)
+        if not db_ok:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Панель обновлена, но в БД ошибка. Запусти `/sync`.",
+                parse_mode='Markdown',
+            )
+            return
+
+        renamed = rename_traffic_email(panel_name, old_email, new_email)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ **Email изменён**\n\n"
+                f"Было: `{old_email}`\n"
+                f"Стало: `{new_email}`\n"
+                f"Панель: `{panel_name}`\n"
+                f"Записей трафика обновлено: {renamed}"
+            ),
+            parse_mode='Markdown',
+        )
+
+    elif action == "comment":
+        new_comment = "" if text == "-" else text
+
+        result = None
+        try:
+            async with _get_panel_api(panel_name) as api:
+                await api.login()
+                result = await api.update_client(old_email, comment=new_comment)
+        except Exception as e:
+            logger.error(f"[admin={update.effective_user.id}] Ошибка setcomment '{panel_name}/{old_email}': {e}")
+
+        if result is not True:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Не удалось обновить комментарий.\n"
+                    f"Возможно, клиента `{old_email}` нет в панели."
+                ),
+                parse_mode='Markdown',
+            )
+            return
+
+        try:
+            update_binding_comment(tg_id, panel_name, old_email, new_comment)
+        except Exception as e:
+            logger.error(f"Не удалось обновить комментарий в БД: {e}")
+
+        shown = f"`{new_comment}`" if new_comment else "*(пустой)*"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ Комментарий обновлён.\n\n"
+                f"Панель: `{panel_name}`\n"
+                f"Клиент: `{old_email}`\n"
+                f"Комментарий: {shown}"
+            ),
+            parse_mode='Markdown',
+        )
+
+
+async def cancel_input_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменяет ожидание ввода после кнопок переименования/комментария."""
+    if context.user_data.pop("pending_input", None):
+        await update.message.reply_text("Отменено.")
+    else:
+        await update.message.reply_text("Нечего отменять.")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    policy_line = "`/policy` - 🔒 Политика конфиденциальности\n" if config.get_policy_url() else ""
+    policy_line = "`/policy` - 🔒 Gizlinlik syýasaty\n" if config.get_policy_url() else ""
     user_id = update.effective_user.id
 
     if config.is_admin(user_id):
@@ -432,12 +616,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         help_text = common
     else:
         help_text = (
-            "**👋 Команды пользователя:**\n"
-            "`/start` - 🚀 Начать работу с ботом\n"
-            "`/help` - ℹ️ Показать эту справку\n"
+            "**👋 Müşderi buýruklary:**\n"
+            "`/start` - 🚀 Boty başlamak\n"
+            "`/help` - ℹ️ Şu gollanmany görkezmek\n"
             f"{policy_line}"
-            "`/guide` - 📚 Гайд по боту\n"
-            "`/mylink` - 🔗 Получить ссылку подписки"
+            "`/guide` - 📚 Bot boýunça gollanma\n"
+            "`/mylink` - 🔗 Abuna salgysyny almak"
         )
 
     await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -1106,10 +1290,10 @@ async def _do_pause(update, context, payload, query) -> None:
     if any_paused:
         await _send_client_notice(
             context, tg_id,
-            "⏸️ **Подписка приостановлена**\n\n"
-            "Дни приостановки не тратятся. "
-            "Когда возобновишь — срок продлится автоматически.\n\n"
-            "Связаться с администратором: 🆘 Нужна помощь"
+            "⏸️ **Abuna saklandy**\n\n"
+            "Saklanyş günleri harç edilmeýär. "
+            "Täzeden işledeniňde — möhlet awtomatik uzaldylar.\n\n"
+            "Administrator bilen habarlaşmak: 🆘 Kömek gerek"
         )
 
 # --- /resumesub ---
@@ -1225,7 +1409,7 @@ async def _do_resume(update, context, payload, query) -> None:
     if resumed:
         await _send_client_notice(
             context, tg_id,
-            "▶️ **Подписка возобновлена.** Срок продлён на дни приостановки."
+            "▶️ **Abuna täzeden işledildi.** Möhlet saklanyş günlerine uzaldylar."
         )
 
 
@@ -1349,15 +1533,14 @@ async def _do_extend(update, context, payload, query) -> None:
         try:
             await context.bot.send_message(
                 chat_id=tg_id,
-                text=f"🎉 **Подписка продлена.** Новый срок: до {last_new_expiry_str}.",
+                text=f"🎉 **Abuna uzaldylar.** Täze möhlet: {last_new_expiry_str} çenli.",
                 parse_mode='Markdown',
             )
         except Exception as e:
             logger.warning(f"Не удалось уведомить клиента {tg_id} о продлении: {e}")
 
+
 # --- /revoke и /listclients ---
-
-
 @admin_only
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на удаление клиента."""
@@ -1849,26 +2032,23 @@ async def _do_addclient(update, context, payload, query) -> None:
         logger.error(f"Не удалось сохранить связку: {e}")
 
     # Уведомление клиенту
+    # Уведомление клиенту
     expiry_line_client = (
-        f"Срок действия: до **{expiry_date_str}**"
-        if expiry_date_str else "Срок действия: **бессрочно**"
+        f"Möhlet: **{expiry_date_str}** çenli"
+        if expiry_date_str else "Möhlet: **möhletsiz**"
     )
-    # Админам не перезаписываем клавиатуру — они получают подписку,
-    # но клавиатура остаётся админская. Ссылку берут через /mylink.
-    keyboard = None if config.is_admin(tg_id) else _client_reply_keyboard()
-
     delivered = True
     try:
         await context.bot.send_message(
             chat_id=tg_id,
             text=(
-                f"🎉 **Твоя подписка готова!**\n\n"
-                f"Панель: **{panel_name}**\n"
-                f"Логин: `{email}`\n"
+                f"🎉 **Seniň abunaň taýýar!**\n\n"
+                f"Panel: **{panel_name}**\n"
+                f"Login: `{email}`\n"
                 f"{expiry_line_client}\n\n"
-                f"**Ссылка подписки:**\n{sub_link}\n\n"
-                f"Кликни по ссылке — откроется браузер. "
-                f"Чтобы скопировать, удерживай палец на ссылке."
+                f"**Abuna salgysy:**\n{sub_link}\n\n"
+                f"Salgyny bas — brauzer açylar. "
+                f"Göçürmek üçin, barmagyňy salgynyň üstünde sakla."
             ),
             parse_mode='Markdown',
             reply_markup=keyboard,
@@ -2000,14 +2180,14 @@ async def policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     url = config.get_policy_url()
     if not url:
         await update.message.reply_text(
-            "🔒 Политика конфиденциальности пока не опубликована. "
-            "Обратитесь к администратору."
+            "🔒 Gizlinlik syýasaty entek çap edilmedi. "
+            "Administratorda ýüz tut."
         )
         return
 
     message = config.get_policy_message()
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Читать полностью", url=url)]
+        [InlineKeyboardButton("📄 Doly okamak", url=url)]
     ])
 
     try:
@@ -2029,7 +2209,7 @@ async def _send_guide(update: Update, role: str) -> None:
     keyboard = None
     if url:
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📖 Читать полностью", url=url)]
+            [InlineKeyboardButton("📖 Doly okamak", url=url)]
         ])
 
     try:
@@ -2071,7 +2251,7 @@ async def mylink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bindings = get_user_bindings(tg_id)
     if not bindings:
         await update.message.reply_text(
-            "У тебя пока нет выданных подписок. Обратись к администратору."
+            "Häzir seniň üçin berlen abuna ýok. Administratorda ýüz tut."
         )
         return
 
@@ -2081,12 +2261,12 @@ async def mylink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not active and paused:
         await update.message.reply_text(
-            "⏸️ Твоя подписка приостановлена.\n\n"
-            "Чтобы возобновить — нажми 🆘 Нужна помощь."
+            "⏸️ Seniň abunaň saklandy.\n\n"
+            "Täzeden işletmek üçin 🆘 Kömek gerek düwmesine bas."
         )
         return
 
-    lines = ["🔗 **Твои ссылки подписки:**\n"]
+    lines = ["🔗 **Seniň abuna salgylaryň:**\n"]
     for b in active:
         panel_config = config.get_panel_config(b["panel_name"])
         sub_url = panel_config.get("sub_url", "").rstrip("/")
@@ -2094,10 +2274,10 @@ async def mylink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             link = f"{sub_url}/{b['sub_id']}"
             lines.append(f"**{b['panel_name']}** ({b['email']}):\n{link}\n")
         else:
-            lines.append(f"**{b['panel_name']}** ({b['email']}): sub_url не настроен\n")
+            lines.append(f"**{b['panel_name']}** ({b['email']}): sub_url sazlanmady\n")
 
     if paused:
-        lines.append("⏸️ *Некоторые подписки приостановлены. Нажми 🆘 Нужна помощь, чтобы возобновить.*")
+        lines.append("⏸️ *Käbir abunalar saklandy. Täzeden işletmek üçin 🆘 Kömek gerek düwmesine bas.*")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
@@ -2109,17 +2289,17 @@ async def btn_my_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def btn_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка '📊 Тарифы' — сообщение с inline-кнопкой на страницу тарифов."""
+    """Кнопка '📊 Nyrhlar' — сообщение с inline-кнопкой на страницу тарифов."""
     url = config.get_tariffs_url()
     if not url:
         await update.message.reply_text(
-            "📊 Тарифы пока не настроены. Обратитесь к администратору."
+            "📊 Nyrhlar entek sazlanmady. Administratorda ýüz tut."
         )
         return
 
     message = config.get_tariffs_message()
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Открыть тарифы", url=url)]
+        [InlineKeyboardButton("📊 Nyrhlary açmak", url=url)]
     ])
 
     try:
@@ -2138,8 +2318,8 @@ async def btn_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     username = f"@{user.username}" if user.username else "—"
 
     await update.message.reply_text(
-        "🆘 Передал ваш запрос администратору.\n"
-        "Он свяжется с вами в личных сообщениях в ближайшее время."
+        "🆘 Haýyşyňy administrada iberdim.\n"
+        "Ol tiz wagtyň içinde şahsy habarlaşar."
     )
 
     notif = (
@@ -2396,13 +2576,13 @@ def main() -> None:
     application.add_handler(CommandHandler("listpanels", listpanels_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(MessageHandler(
-        filters.Regex("^🔗 Ссылка подписки$"), btn_my_link
+        filters.Regex("^🔗 Abuna salgysy$"), btn_my_link
     ))
     application.add_handler(MessageHandler(
-        filters.Regex("^📊 Тарифы$"), btn_tariffs
+        filters.Regex("^📊 Nyrhlar$"), btn_tariffs
     ))
     application.add_handler(MessageHandler(
-        filters.Regex("^🆘 Нужна помощь$"), btn_help
+        filters.Regex("^🆘 Kömek gerek$"), btn_help
     ))
 
     # Reply-кнопки админа
@@ -2410,10 +2590,10 @@ def main() -> None:
         filters.Regex("^➕ Добавить пользователя$"), btn_admin_add
     ))
     application.add_handler(MessageHandler(
-        filters.Regex("^⏸️ Пауза$"), btn_admin_pause
+        filters.Regex("^✏️ Переименовать$"), btn_admin_rename
     ))
     application.add_handler(MessageHandler(
-        filters.Regex("^▶️ Продолжить$"), btn_admin_resume
+        filters.Regex("^💬 Комментарий$"), btn_admin_comment
     ))
     application.add_handler(MessageHandler(
         filters.Regex("^📅 Продлить$"), btn_admin_extend
@@ -2423,6 +2603,10 @@ def main() -> None:
     ))
     logger.info("Бот запущен...")
     application.run_polling(drop_pending_updates=True)
+    application.add_handler(CommandHandler("cancel_input", cancel_input_command))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, pending_input_handler
+    ))
 
 
 if __name__ == "__main__":
