@@ -1685,17 +1685,14 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             continue
 
         # 2. Карта UUID → {email, comment, limitHwid, expiryTime}
+        # В 3.8.x UUID клиента — это поле "id". Поле "uuid" не используется.
         panel_clients = {}
         for inbound in inbounds_data.get("obj", []):
-            settings_raw = inbound.get("settings", "")
-            if not settings_raw:
-                continue
-            try:
-                settings = json.loads(settings_raw)
-            except (ValueError, TypeError):
+            settings = _parse_settings(inbound.get("settings"))
+            if not settings:
                 continue
             for client in settings.get("clients", []) or []:
-                c_uuid = client.get("uuid") or ""
+                c_uuid = client.get("id") or client.get("uuid") or ""
                 if c_uuid:
                     panel_clients[c_uuid] = {
                         "email": client.get("email") or "",
