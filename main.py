@@ -28,6 +28,7 @@ from database import (
     set_binding_paused, update_binding_expiry,
     update_binding_comment, update_binding_limit_hwid,
     update_binding_email, rename_traffic_email,
+    update_binding_enabled,
 )
 from helpers import (
     _tz,
@@ -43,6 +44,7 @@ from helpers import (
 from jobs import (
     record_traffic_job, daily_report_job,
     check_inbounds_job, expiry_notification_job,
+    auto_sync_job, sync_all_panels,
     _generate_daily_report_text,
 )
 
@@ -1277,6 +1279,7 @@ async def _do_pause(update, context, payload, query) -> None:
 
         if result is True:
             set_binding_paused(tg_id, panel_name, email, pause_ts)
+            update_binding_enabled(tg_id, panel_name, email, False)
             lines.append(_render_binding_line(panel_name, email, "✅ приостановлена"))
             any_paused = True
         elif result is False:
@@ -1394,6 +1397,7 @@ async def _do_resume(update, context, payload, query) -> None:
 
         if result is True:
             set_binding_paused(tg_id, panel_name, email, None)
+            update_binding_enabled(tg_id, panel_name, email, True)
             if new_expiry_str:
                 update_binding_expiry(tg_id, panel_name, email, new_expiry_str)
             lines.append(_render_binding_line(panel_name, email, resumed_status, line_extra))
@@ -1833,137 +1837,32 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ---------- /sync ----------
 @superadmin_only
+@superadmin_only
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Синхронизирует БД из панели: email, комментарий, HWID, срок действия."""
+    """Синхронизирует БД из панели."""
     await update.message.reply_text("🔄 Запускаю синхронизацию. Это займёт несколько секунд...")
 
-    all_panels = config.get_all_panels()
-    if not all_panels:
+    result = await sync_all_panels()
+
+    if not result["details"]:
         await update.message.reply_text("Панели не настроены.")
         return
 
-    total_updated = 0
-    total_renamed = 0
-    total_missing = 0
     lines = []
-
-    for panel_name, pconf in all_panels.items():
-        if pconf.get("disabled", False):
-            lines.append(f"⏭️ **{panel_name}**: отключена")
-            continue
-
-        # 1. Все клиенты панели
-        try:
-            async with _get_panel_api(panel_name) as api:
-                await api.login()
-                inbounds_data = await api.get_inbounds()
-        except Exception as e:
-            logger.error(f"[sync] Ошибка '{panel_name}': {e}")
-            lines.append(f"❌ **{panel_name}**: ошибка связи")
-            continue
-
-        if not inbounds_data or not inbounds_data.get("success"):
-            lines.append(f"❌ **{panel_name}**: не удалось получить данные")
-            continue
-
-        # 2. Карта UUID → {email, comment, limitHwid, expiryTime}
-        # В 3.8.x UUID клиента — это поле "id". Поле "uuid" не используется.
-        panel_clients = {}
-        for inbound in inbounds_data.get("obj", []):
-            settings = _parse_settings(inbound.get("settings"))
-            if not settings:
-                continue
-            for client in settings.get("clients", []) or []:
-                c_uuid = client.get("id") or client.get("uuid") or ""
-                if c_uuid:
-                    panel_clients[c_uuid] = {
-                        "email": client.get("email") or "",
-                        "comment": client.get("comment") or "",
-                        "limitHwid": int(client.get("limitHwid") or 0),
-                        "expiryTime": int(client.get("expiryTime") or 0),
-                    }
-
-        # 3. Обходим связки панели
-        panel_bindings = [b for b in list_all_bindings() if b["panel_name"] == panel_name]
-
-        panel_upd = 0
-        panel_ren = 0
-        panel_miss = 0
-
-        for b in panel_bindings:
-            b_uuid = b.get("uuid") or ""
-            if not b_uuid or b_uuid not in panel_clients:
-                panel_miss += 1
-                logger.warning(
-                    f"[sync] {panel_name}: потеряна связка "
-                    f"tg_id={b['tg_id']}, email={b['email']}, uuid={b_uuid or '(пусто)'}"
-                )
-                continue
-
-            pc = panel_clients[b_uuid]
-            old_email = b["email"]
-            new_email = pc["email"]
-
-            # 3.1. Смена email
-            if new_email and new_email != old_email:
-                db_ok = update_binding_email(b["tg_id"], panel_name, old_email, new_email)
-                if db_ok:
-                    renamed = rename_traffic_email(panel_name, old_email, new_email)
-                    logger.info(
-                        f"[sync] {panel_name}: '{old_email}' -> '{new_email}' "
-                        f"({renamed} записей трафика)"
-                    )
-                    panel_ren += 1
-                    total_renamed += 1
-                else:
-                    logger.warning(f"[sync] Не удалось переименовать {old_email} -> {new_email}")
-
-            # Для дальнейших проверок используем актуальный email
-            current_email = new_email or old_email
-
-            # 3.2. Комментарий
-            if pc["comment"] != (b.get("comment") or ""):
-                try:
-                    update_binding_comment(b["tg_id"], panel_name, current_email, pc["comment"])
-                    panel_upd += 1
-                except Exception as e:
-                    logger.error(f"[sync] Ошибка обновления комментария: {e}")
-
-            # 3.3. HWID
-            if pc["limitHwid"] != (b.get("limit_hwid") or 0):
-                try:
-                    update_binding_limit_hwid(b["tg_id"], panel_name, current_email, pc["limitHwid"])
-                    panel_upd += 1
-                except Exception as e:
-                    logger.error(f"[sync] Ошибка обновления HWID: {e}")
-
-            # 3.4. Срок
-            new_expiry = None
-            if pc["expiryTime"] > 0:
-                try:
-                    new_expiry = datetime.fromtimestamp(
-                        pc["expiryTime"] / 1000, _tz()
-                    ).strftime("%Y-%m-%d")
-                except (ValueError, OSError):
-                    new_expiry = None
-            if (new_expiry or "") != (b.get("expiry_date") or ""):
-                try:
-                    update_binding_expiry(b["tg_id"], panel_name, current_email, new_expiry)
-                    panel_upd += 1
-                except Exception as e:
-                    logger.error(f"[sync] Ошибка обновления expiry: {e}")
-
-        total_updated += panel_upd
-        total_missing += panel_miss
-
-        lines.append(
-            f"✅ **{panel_name}**: обновлено {panel_upd}, "
-            f"переименовано {panel_ren}, потеряно {panel_miss}"
-        )
+    for d in result["details"]:
+        if d["status"] == "ok":
+            lines.append(
+                f"✅ **{d['panel_name']}**: обновлено {d['updated']}, "
+                f"переименовано {d['renamed']}, потеряно {d['missing']}"
+            )
+        elif d["status"] == "disabled":
+            lines.append(f"⏭️ **{d['panel_name']}**: отключена")
+        elif d["status"] == "error":
+            lines.append(f"❌ **{d['panel_name']}**: ошибка связи")
 
     lines.append(
-        f"\n**Итого:** обновлено {total_updated}, "
-        f"переименовано {total_renamed}, не найдено в панели {total_missing}"
+        f"\n**Итого:** обновлено {result['total_updated']}, "
+        f"переименовано {result['total_renamed']}, не найдено в панели {result['total_missing']}"
     )
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
@@ -2108,6 +2007,8 @@ def _format_client_binding(b: dict) -> str:
         status_icon = "🚫"
     elif b.get("paused_at"):
         status_icon = "⏸️"
+    elif not b.get("enabled", True):
+        status_icon = "⛔"
     else:
         status_icon = "▶️"
 
@@ -2503,6 +2404,7 @@ def main() -> None:
         report_hour = config.get_daily_report_hour()
         job_queue.run_daily(daily_report_job, time=_scheduled_time(report_hour))
         job_queue.run_daily(expiry_notification_job, time=_scheduled_time(9, 0))
+        job_queue.run_daily(auto_sync_job, time=_scheduled_time(0, 1))
     else:
         logger.warning("JobQueue не инициализирован.")
 

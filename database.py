@@ -89,6 +89,9 @@ def init_db():
     if "comment" not in cols:
         conn.execute("ALTER TABLE client_bindings ADD COLUMN comment TEXT")
         logger.info("Миграция: добавлена колонка comment")
+    if "enabled" not in cols:
+        conn.execute("ALTER TABLE client_bindings ADD COLUMN enabled INTEGER DEFAULT 1")
+        logger.info("Миграция: добавлена колонка enabled")
 
     conn.commit()
     conn.close()
@@ -289,23 +292,25 @@ def save_binding(
     limit_hwid: int = 0,
     expiry_date: str = None,
     comment: str = None,
+    enabled: bool = True,
 ) -> None:
     """Сохраняет или обновляет связку клиента."""
     conn = _get_conn()
     conn.execute(
         """INSERT INTO client_bindings
                (tg_id, panel_name, email, inbound_ids, sub_id, uuid,
-                limit_hwid, expiry_date, comment)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                limit_hwid, expiry_date, comment, enabled)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(tg_id, panel_name, email) DO UPDATE SET
                inbound_ids = excluded.inbound_ids,
                sub_id      = excluded.sub_id,
                uuid        = excluded.uuid,
                limit_hwid  = excluded.limit_hwid,
                expiry_date = excluded.expiry_date,
-               comment     = excluded.comment""",
+               comment     = excluded.comment,
+               enabled     = excluded.enabled""",
         (int(tg_id), panel_name, email, json.dumps(inbound_ids),
-         sub_id, uuid, int(limit_hwid), expiry_date, comment),
+         sub_id, uuid, int(limit_hwid), expiry_date, comment, 1 if enabled else 0),
     )
     conn.commit()
     conn.close()
@@ -564,3 +569,15 @@ def rename_traffic_email(panel_name: str, old_email: str, new_email: str) -> int
     conn.commit()
     conn.close()
     return updated
+
+
+def update_binding_enabled(tg_id: int, panel_name: str, email: str, enabled: bool) -> None:
+    """Обновляет статус включён/отключён в связке."""
+    conn = _get_conn()
+    conn.execute(
+        """UPDATE client_bindings SET enabled = ?
+           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
+        (1 if enabled else 0, int(tg_id), panel_name, email),
+    )
+    conn.commit()
+    conn.close()

@@ -168,20 +168,22 @@ def _parse_expiry_input(text: str) -> tuple:
         return 0, None, None
 
     try:
-        parsed = datetime.strptime(text, "%Y-%m-%d")
+        parsed_naive = datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
         return None, None, "Не понял формат. Введи дату `ГГГГ-ММ-ДД`, или нажми кнопку, или `/skip`."
 
     now = datetime.now(_tz())
-    if parsed.date() < now.date():
+    if parsed_naive.date() < now.date():
         return None, None, "Дата уже прошла. Введи будущую дату."
 
+    # Делаем parsed "aware" — тот же tzinfo, что и now, иначе сравнение падает
+    parsed_aware = parsed_naive.replace(tzinfo=_tz())
     max_date = now + timedelta(days=365 * 10)
-    if parsed > max_date:
+    if parsed_aware > max_date:
         return None, None, "Дата слишком далеко (максимум 10 лет вперёд)."
 
-    target_dt = datetime.combine(parsed.date(), time(23, 59, 59), tzinfo=_tz())
-    return int(target_dt.timestamp() * 1000), parsed.strftime("%Y-%m-%d"), None
+    target_dt = datetime.combine(parsed_naive.date(), time(23, 59, 59), tzinfo=_tz())
+    return int(target_dt.timestamp() * 1000), parsed_naive.strftime("%Y-%m-%d"), None
 
 
 def _days_between(start_str: str, end_str: str) -> int:

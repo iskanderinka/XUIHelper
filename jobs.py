@@ -27,8 +27,12 @@ from database import (
     get_daily_stats, get_panel_daily_stats, get_top_users, has_daily_traffic_snapshot,
     list_all_bindings,
     has_recent_notification, log_notification,
+    update_binding_email, update_binding_comment,
+    update_binding_limit_hwid, update_binding_expiry,
+    update_binding_enabled, rename_traffic_email,
 )
 from helpers import _bytes_to_gb, _tz, _get_panel_api
+from xui_api import _parse_settings
 
 logger = logging.getLogger(__name__)
 
@@ -309,3 +313,200 @@ async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
                 sent_count += 1
 
     logger.info(f"Задача завершена. Отправлено уведомлений: {sent_count}.")
+
+
+async def sync_all_panels() -> dict:
+    """
+    Синхронизирует БД со всеми панелями.
+
+    В 3.8.0 данные клиента разделены:
+      - /inbounds/list       — базовое (email, uuid, enable, expiryTime)
+      - /clients/get/<email> — расширенное (limitHwid, comment, tgId, ...)
+
+    Поэтому для каждой связки делаем ОТДЕЛЬНЫЙ запрос на полный объект.
+    Быстро только по одному запросу на панель: строим карту uuid → email
+    из inbounds/list, потом идём точечно в clients/get.
+    """
+    all_panels = config.get_all_panels()
+    if not all_panels:
+        return {"total_updated": 0, "total_renamed": 0, "total_missing": 0, "details": []}
+
+    total_updated = 0
+    total_renamed = 0
+    total_missing = 0
+    details = []
+
+    for panel_name, pconf in all_panels.items():
+        if pconf.get("disabled", False):
+            details.append({"panel_name": panel_name, "status": "disabled"})
+            continue
+
+        try:
+            async with _get_panel_api(panel_name) as api:
+                await api.login()
+
+                # 1. Карта uuid → email из общего списка (один запрос)
+                inbounds_data = await api.get_inbounds()
+                if not inbounds_data or not inbounds_data.get("success"):
+                    details.append({"panel_name": panel_name, "status": "error"})
+                    continue
+
+                uuid_to_email = {}
+                for inbound in inbounds_data.get("obj", []):
+                    settings = _parse_settings(inbound.get("settings"))
+                    if not settings:
+                        continue
+                    for client in settings.get("clients", []) or []:
+                        c_uuid = client.get("uuid") or client.get("id") or ""
+                        c_email = client.get("email") or ""
+                        if c_uuid and c_email:
+                            uuid_to_email[c_uuid] = c_email
+
+                # 2. Обход связок панели
+                panel_bindings = [b for b in list_all_bindings() if b["panel_name"] == panel_name]
+                panel_upd = 0
+                panel_ren = 0
+                panel_miss = 0
+
+                for b in panel_bindings:
+                    b_uuid = b.get("uuid") or ""
+                    if not b_uuid or b_uuid not in uuid_to_email:
+                        panel_miss += 1
+                        logger.warning(
+                            f"[sync] {panel_name}: потеряна связка "
+                            f"tg_id={b['tg_id']}, email={b['email']}, uuid={b_uuid or '(пусто)'}"
+                        )
+                        continue
+
+                    email_in_panel = uuid_to_email[b_uuid]
+
+                    # 3. Полный объект клиента (расширенное поле limitHwid там)
+                    full = await api.get_client_object(email_in_panel)
+                    if not full:
+                        panel_miss += 1
+                        logger.warning(
+                            f"[sync] {panel_name}: get_client_object вернул None для {email_in_panel}"
+                        )
+                        continue
+
+                    old_email = b["email"]
+                    new_email = full.get("email") or email_in_panel
+
+                    # 3.1. Смена email
+                    if new_email and new_email != old_email:
+                        db_ok = update_binding_email(b["tg_id"], panel_name, old_email, new_email)
+                        if db_ok:
+                            renamed = rename_traffic_email(panel_name, old_email, new_email)
+                            logger.info(
+                                f"[sync] {panel_name}: '{old_email}' -> '{new_email}' "
+                                f"({renamed} записей трафика)"
+                            )
+                            panel_ren += 1
+                            total_renamed += 1
+                        else:
+                            logger.warning(f"[sync] Не удалось переименовать {old_email} -> {new_email}")
+
+                    current_email = new_email or old_email
+
+                    # 3.2. Комментарий
+                    new_comment = full.get("comment") or ""
+                    if new_comment != (b.get("comment") or ""):
+                        try:
+                            update_binding_comment(b["tg_id"], panel_name, current_email, new_comment)
+                            panel_upd += 1
+                        except Exception as e:
+                            logger.error(f"[sync] Ошибка обновления комментария: {e}")
+
+                    # 3.3. HWID
+                    new_hwid = int(full.get("limitHwid") or 0)
+                    if new_hwid != (b.get("limit_hwid") or 0):
+                        try:
+                            update_binding_limit_hwid(b["tg_id"], panel_name, current_email, new_hwid)
+                            panel_upd += 1
+                        except Exception as e:
+                            logger.error(f"[sync] Ошибка обновления HWID: {e}")
+
+                    # 3.4. Срок
+                    new_expiry = None
+                    expiry_ts = int(full.get("expiryTime") or 0)
+                    if expiry_ts > 0:
+                        try:
+                            new_expiry = datetime.fromtimestamp(expiry_ts / 1000, _tz()).strftime("%Y-%m-%d")
+                        except (ValueError, OSError):
+                            new_expiry = None
+                    if (new_expiry or "") != (b.get("expiry_date") or ""):
+                        try:
+                            update_binding_expiry(b["tg_id"], panel_name, current_email, new_expiry)
+                            panel_upd += 1
+                        except Exception as e:
+                            logger.error(f"[sync] Ошибка обновления expiry: {e}")
+
+                    # 3.5. Статус enabled
+                    db_enabled = bool(b.get("enabled", 1))
+                    panel_enabled = bool(full.get("enable", True))
+                    if panel_enabled != db_enabled:
+                        try:
+                            update_binding_enabled(b["tg_id"], panel_name, current_email, panel_enabled)
+                            panel_upd += 1
+                        except Exception as e:
+                            logger.error(f"[sync] Ошибка обновления enabled: {e}")
+
+        except Exception as e:
+            logger.error(f"[sync] Ошибка '{panel_name}': {e}")
+            details.append({"panel_name": panel_name, "status": "error", "error": str(e)})
+            continue
+
+        total_updated += panel_upd
+        total_missing += panel_miss
+        details.append({
+            "panel_name": panel_name,
+            "status": "ok",
+            "updated": panel_upd,
+            "renamed": panel_ren,
+            "missing": panel_miss,
+        })
+
+    return {
+        "total_updated": total_updated,
+        "total_renamed": total_renamed,
+        "total_missing": total_missing,
+        "details": details,
+    }
+
+
+
+async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная автосинхронизация БД с панелями (00:01 Asia/Ashgabat)."""
+    logger.info("Запуск задачи: auto_sync_job")
+
+    result = await sync_all_panels()
+    logger.info(
+        f"[auto_sync] обновлено {result['total_updated']}, "
+        f"переименовано {result['total_renamed']}, "
+        f"потеряно {result['total_missing']}"
+    )
+
+    # Уведомляем админов только если были реальные изменения
+    if not (result["total_updated"] or result["total_renamed"] or result["total_missing"]):
+        return
+
+    lines = ["🔄 **Автосинхронизация БД с панелями**\n"]
+    for d in result["details"]:
+        if d["status"] == "ok":
+            lines.append(
+                f"**{d['panel_name']}**: обновлено {d['updated']}, "
+                f"переименовано {d['renamed']}, потеряно {d['missing']}"
+            )
+        elif d["status"] == "disabled":
+            lines.append(f"⏭️ **{d['panel_name']}**: отключена")
+        elif d["status"] == "error":
+            lines.append(f"❌ **{d['panel_name']}**: ошибка связи")
+
+    text = "\n".join(lines)
+    for uid in config.get_admin_users():
+        try:
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"[auto_sync] Не удалось уведомить {uid}: {e}")
+
+
