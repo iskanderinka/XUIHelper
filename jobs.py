@@ -19,6 +19,7 @@
 import logging
 from datetime import datetime, timedelta
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 import config
@@ -249,20 +250,17 @@ async def _notify_admins_expired(
             logger.error(f"Не удалось уведомить админа {uid}: {e}")
 
 
-async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
+async def client_expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Ежедневная задача:
-      - за 7 и 3 дня до окончания — напоминание клиенту;
-      - на следующий день после окончания — алерт всем админам.
+    Ежедневная задача (09:00): напоминания клиентам за 7 и 3 дня до окончания.
     """
-    logger.info("Запуск задачи: expiry_notification_job")
+    logger.info("Запуск задачи: client_expiry_notification_job")
     bindings = list_all_bindings()
     if not bindings:
         logger.info("Нет выданных клиентов — задача пропущена.")
         return
 
     today = datetime.now(_tz()).date()
-    admin_users = config.get_admin_users()
     sent_count = 0
 
     for b in bindings:
@@ -303,8 +301,45 @@ async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
                 log_notification(tg_id, panel_name, email, "3d", expiry_str)
                 sent_count += 1
 
+    logger.info(f"Задача завершена. Отправлено клиентских напоминаний: {sent_count}.")
+
+
+async def admin_expired_notification_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ежедневная задача (06:00): алерт админам на следующий день после окончания подписки.
+    """
+    logger.info("Запуск задачи: admin_expired_notification_job")
+    bindings = list_all_bindings()
+    if not bindings:
+        logger.info("Нет выданных клиентов — задача пропущена.")
+        return
+
+    today = datetime.now(_tz()).date()
+    admin_users = config.get_admin_users()
+    sent_count = 0
+
+    for b in bindings:
+        expiry_str = b.get("expiry_date")
+        if not expiry_str:
+            continue  # бессрочно
+
+        # Подписка на паузе — не тревожим админа
+        if b.get("paused_at"):
+            continue
+
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        except ValueError:
+            logger.warning(f"Некорректная дата '{expiry_str}' у {b['panel_name']}/{b['email']}")
+            continue
+
+        days_left = (expiry_date - today).days
+        tg_id = b["tg_id"]
+        panel_name = b["panel_name"]
+        email = b["email"]
+
         # На следующий день после окончания
-        elif days_left == -1:
+        if days_left == -1:
             if not has_recent_notification(tg_id, panel_name, email, "expired", expiry_str):
                 await _notify_admins_expired(
                     context, admin_users, tg_id, panel_name, email, expiry_str
@@ -312,7 +347,7 @@ async def expiry_notification_job(context: ContextTypes.DEFAULT_TYPE):
                 log_notification(tg_id, panel_name, email, "expired", expiry_str)
                 sent_count += 1
 
-    logger.info(f"Задача завершена. Отправлено уведомлений: {sent_count}.")
+    logger.info(f"Задача завершена. Отправлено админских алертов: {sent_count}.")
 
 
 async def sync_all_panels() -> dict:
@@ -510,3 +545,74 @@ async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"[auto_sync] Не удалось уведомить {uid}: {e}")
 
 
+async def _send_client_expired_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_id: int,
+    panel_name: str,
+    email: str,
+    expiry_str: str,
+) -> None:
+    """Уведомляет клиента, что подписка истекла, с inline-кнопкой «Нужна помощь»."""
+    text = (
+        f"⏰ **Abunaňyz gutardy**\n\n"
+        f"**{expiry_str}** senesinde abunaňyz gutardy.\n\n"
+        f"Eger bu ýalňyşlyk bilen bolan bolsa ýa-da abunany uzaltmak isleseňiz — "
+        f"biz bilen habarlaşyň."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆘 Kömek gerek", callback_data="client:help")]
+    ])
+    try:
+        await context.bot.send_message(
+            chat_id=tg_id,
+            text=text,
+            parse_mode='Markdown',
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить клиента {tg_id} об истечении: {e}")
+
+
+async def client_expired_notification_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ежедневная задача (23:59): уведомление клиенту об истечении подписки сегодня.
+    Срабатывает только для активных подписок (не на паузе).
+    """
+    logger.info("Запуск задачи: client_expired_notification_job")
+    bindings = list_all_bindings()
+    if not bindings:
+        logger.info("Нет выданных клиентов — задача пропущена.")
+        return
+
+    today = datetime.now(_tz()).date()
+    sent_count = 0
+
+    for b in bindings:
+        expiry_str = b.get("expiry_date")
+        if not expiry_str:
+            continue  # бессрочно
+
+        if b.get("paused_at"):
+            continue  # на паузе
+
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        except ValueError:
+            logger.warning(f"Некорректная дата '{expiry_str}' у {b['panel_name']}/{b['email']}")
+            continue
+
+        days_left = (expiry_date - today).days
+        tg_id = b["tg_id"]
+        panel_name = b["panel_name"]
+        email = b["email"]
+
+        # Последний день подписки
+        if days_left == 0:
+            if not has_recent_notification(tg_id, panel_name, email, "expired_client", expiry_str):
+                await _send_client_expired_notice(
+                    context, tg_id, panel_name, email, expiry_str
+                )
+                log_notification(tg_id, panel_name, email, "expired_client", expiry_str)
+                sent_count += 1
+
+    logger.info(f"Задача завершена. Отправлено клиентских уведомлений об истечении: {sent_count}.")

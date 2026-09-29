@@ -352,7 +352,12 @@ def _admin_action_keyboard(
     page: int,
     page_size: int = ADMIN_ACTION_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
-    """Inline-клавиатура выбора клиента для админского действия."""
+    """Inline-клавиатура выбора клиента для админского действия.
+
+    Callback_data содержит АБСОЛЮТНЫЙ индекс в списке bindings,
+    а не tg_id/panel_name. Это защищает от конфликтов при одинаковых
+    tg_id+panel у разных подписок и не упирается в лимит 64 байта.
+    """
     total = len(bindings)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
@@ -362,14 +367,10 @@ def _admin_action_keyboard(
     chunk = bindings[start:end]
 
     rows = []
-    for b in chunk:
+    for i, b in enumerate(chunk):
+        index = start + i  # абсолютный индекс
         label = f"{b['panel_name']}/{b['email']}"
-        # Telegram ограничивает callback_data 64 байтами.
-        # panel_name и email не должны содержать ':' — предполагаем это.
-        cb = f"admact:sel:{action}:{b['tg_id']}:{b['panel_name']}"
-        if len(cb.encode("utf-8")) > 60:
-            # Fallback: обрезаем
-            label = label[:27] + "…"
+        cb = f"admact:sel:{action}:{index}"
         rows.append([InlineKeyboardButton(label, callback_data=cb)])
 
     nav = []
@@ -408,8 +409,53 @@ def _render_admin_action_page(
     for b in chunk:
         expiry = b.get("expiry_date") or "бессрочно"
         status_icon = "⏸️" if b.get("paused_at") else "▶️"
-        lines.append(f"{status_icon} `{b['panel_name']}/{b['email']}` — до `{expiry}`")
+        lines.append(
+            f"{status_icon} `{b['panel_name']}` 👤 `{b['email']}` — до `{expiry}`"
+        )
 
     text = "\n".join(lines)
     keyboard = _admin_action_keyboard(bindings, action, page, page_size)
     return text, keyboard
+
+
+def _parse_broadcast_args(args: list) -> tuple:
+    """
+    Парсит аргументы команды /broadcast.
+
+    Формат:
+      /broadcast текст             → (None, "текст")           всем
+      /broadcast 123456789 текст   → (123456789, "текст")      конкретному
+
+    Возвращает (target_tg_id, message, error):
+      target_tg_id — int или None (всем)
+      message — str
+      error — str или None при ошибке
+    """
+    if not args:
+        return None, None, "Формат: `/broadcast [tg_id] <текст>`"
+
+    # Первое слово — число? Тогда это target_tg_id
+    target_tg_id = None
+    text_parts = args
+
+    first = args[0].strip()
+    # Проверяем, похоже ли на tg_id (только цифры)
+    if first.lstrip("-").isdigit():
+        try:
+            target_tg_id = int(first)
+        except ValueError:
+            pass
+        else:
+            text_parts = args[1:]
+
+    if not text_parts:
+        return None, None, "Не указан текст сообщения."
+
+    message = " ".join(text_parts).strip()
+    if not message:
+        return None, None, "Текст сообщения пустой."
+
+    if len(message) > 4000:
+        return None, None, f"Слишком длинное сообщение ({len(message)} символов, максимум 4000)."
+
+    return target_tg_id, message, None

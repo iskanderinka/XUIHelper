@@ -98,22 +98,26 @@ def init_db():
     logger.info("Database initialised at %s", DB_PATH)
 
 # ---------- Снимки трафика ----------
-
-
 def batch_record_traffic(records: List[Tuple]):
     """Each tuple: (panel_name, email, upload, download, total_bytes, expiry_time, record_date)"""
     if not records:
         return
+
+    # Время из Python, а не из SQLite localtime — не зависит от TZ системы
+    import config
+    from zoneinfo import ZoneInfo
+    now_str = datetime.now(ZoneInfo(config.get_timezone())).strftime("%Y-%m-%d %H:%M:%S")
+
     conn = _get_conn()
     conn.executemany(
         """INSERT INTO traffic_records
-               (panel_name, email, upload, download, total_bytes, expiry_time, record_date)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+               (panel_name, email, upload, download, total_bytes, expiry_time, record_date, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(panel_name, email, record_date)
            DO UPDATE SET upload=excluded.upload, download=excluded.download,
                          total_bytes=excluded.total_bytes, expiry_time=excluded.expiry_time,
-                         created_at=datetime('now','localtime')""",
-        records,
+                         created_at=excluded.created_at""",
+        [tuple(r) + (now_str,) for r in records],
     )
     conn.commit()
     conn.close()
@@ -240,14 +244,11 @@ def get_top_users(start_date: str, end_date: str,
              "panel_name": r["panel_name"],
              "total_usage": r["total_usage"] or 0} for r in rows]
 
-
 def has_daily_traffic_snapshot(record_date: str) -> bool:
-    """Проверяет, есть ли за дату снимок, сделанный по расписанию (после 23:00)."""
+    """Проверяет, есть ли за дату снимок трафика."""
     conn = _get_conn()
     row = conn.execute(
-        """SELECT 1 FROM traffic_records
-           WHERE record_date = ? AND time(created_at) >= '23:00:00'
-           LIMIT 1""",
+        "SELECT 1 FROM traffic_records WHERE record_date = ? LIMIT 1",
         (record_date,),
     ).fetchone()
     conn.close()

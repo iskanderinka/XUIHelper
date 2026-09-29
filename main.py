@@ -40,10 +40,13 @@ from helpers import (
     _client_reply_keyboard, _admin_reply_keyboard, _ask_confirm,
     _render_binding_line, _send_client_notice, _edit_query_safely,
     _admin_action_keyboard, _render_admin_action_page,
+    _parse_broadcast_args,
 )
 from jobs import (
     record_traffic_job, daily_report_job,
-    check_inbounds_job, expiry_notification_job,
+    check_inbounds_job,
+    client_expiry_notification_job, admin_expired_notification_job,
+    client_expired_notification_job,
     auto_sync_job, sync_all_panels,
     _generate_daily_report_text,
 )
@@ -259,11 +262,19 @@ async def _open_admin_action_list(
     context: ContextTypes.DEFAULT_TYPE,
     action: str,
 ) -> None:
-    """Открывает список клиентов для админского действия."""
+    """Открывает список клиентов для админского действия.
+
+    Список сохраняется в user_data, чтобы по клику на кнопку
+    взять связку по индексу, а не переискивать все.
+    """
     bindings = list_all_bindings_with_users()
     if not bindings:
         await update.message.reply_text("Пока нет ни одного выданного клиента.")
         return
+
+    # Сохраняем список — он нужен для callback-обработчика
+    context.user_data["admact_list"] = bindings
+    context.user_data["admact_action"] = action
 
     text, keyboard = _render_admin_action_page(bindings, action, 0)
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
@@ -293,6 +304,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Обработка навигации и выбора в админском списке клиентов."""
     query = update.callback_query
     await query.answer()
+
     data = query.data or ""
     parts = data.split(":")
 
@@ -302,46 +314,55 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.delete()
         except Exception:
             pass
+        context.user_data.pop("admact_list", None)
+        context.user_data.pop("admact_action", None)
         return
 
-    # admact:page:<action>:<page> — навигация
+    # admact:page:<action>:<page> — навигация по страницам
     if len(parts) == 4 and parts[1] == "page":
         action = parts[2]
         try:
             page = int(parts[3])
         except ValueError:
             return
-        bindings = list_all_bindings_with_users()
-        if not bindings:
-            await query.edit_message_text("Пока нет ни одного выданного клиента.")
+
+        saved = context.user_data.get("admact_list")
+        if not saved:
+            await query.edit_message_text(
+                "⚠️ Список устарел (бот перезапускался). Открой заново через кнопку."
+            )
             return
-        text, keyboard = _render_admin_action_page(bindings, action, page)
+
+        text, keyboard = _render_admin_action_page(saved, action, page)
         try:
             await query.edit_message_text(text, parse_mode='Markdown', reply_markup=keyboard)
         except Exception as e:
             logger.debug(f"edit_message_text: {e}")
         return
 
-    # admact:sel:<action>:<tg_id>:<panel> — выбор клиента
-    if len(parts) == 5 and parts[1] == "sel":
+    # admact:sel:<action>:<index> — выбор клиента по индексу
+    if len(parts) == 4 and parts[1] == "sel":
         action = parts[2]
         try:
-            tg_id = int(parts[3])
+            index = int(parts[3])
         except ValueError:
             return
-        panel_name = parts[4]
 
-        bindings = _find_bindings_for_admin(tg_id)
-        bindings = [b for b in bindings if b["panel_name"] == panel_name]
-        if not bindings:
+        saved = context.user_data.get("admact_list")
+        if not saved or index < 0 or index >= len(saved):
             await query.edit_message_text(
-                "Клиент не найден. Возможно, данные изменились."
+                "⚠️ Список устарел (бот перезапускался). Открой заново через кнопку."
             )
+            context.user_data.pop("admact_list", None)
+            context.user_data.pop("admact_action", None)
             return
 
-        b = bindings[0]
+        b = saved[index]
+        tg_id = b["tg_id"]
+        panel_name = b["panel_name"]
         email = b["email"]
 
+        # Всё дальше — работа с ОДНОЙ связкой
         if action == "pause":
             status = "уже на паузе" if b.get("paused_at") else "будет приостановлена"
             preview = (
@@ -350,7 +371,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
             await _ask_confirm(
                 query.message.chat_id, context, "pause",
-                {"tg_id": tg_id, "bindings": bindings}, preview,
+                {"tg_id": tg_id, "bindings": [b]}, preview,
             )
 
         elif action == "resume":
@@ -362,7 +383,30 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             preview = f"Возобновить подписку клиента `{tg_id}`:\n\n{line}"
             await _ask_confirm(
                 query.message.chat_id, context, "resume",
-                {"tg_id": tg_id, "bindings": bindings}, preview,
+                {"tg_id": tg_id, "bindings": [b]}, preview,
+            )
+
+        elif action == "extend":
+            old = b.get("expiry_date") or "бессрочно"
+            await query.edit_message_text(
+                f"📅 **Продлить подписку**\n\n"
+                f"Клиент: `{tg_id}`, подписка `{email}` (сейчас: {old})\n\n"
+                f"Отправь в чат команду:\n"
+                f"`/extendsub {tg_id} +30 {email}`\n\n"
+                f"Или с конкретной датой:\n"
+                f"`/extendsub {tg_id} 2027-01-01 {email}`",
+                parse_mode='Markdown',
+            )
+
+        elif action == "revoke":
+            preview = (
+                f"**Удалить клиента** `{tg_id}`:\n\n"
+                f"Подписка `{email}`\n\n"
+                f"⚠️ Клиент будет **удалён из панели** и БД."
+            )
+            await _ask_confirm(
+                query.message.chat_id, context, "revoke",
+                {"tg_id": tg_id, "bindings": [b]}, preview,
             )
 
         elif action == "rename":
@@ -398,29 +442,6 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Чтобы очистить — отправь `-`.\n\n"
                 f"Отмена: `/cancel_input`",
                 parse_mode='Markdown',
-            )
-
-        elif action == "extend":
-            old = b.get("expiry_date") or "бессрочно"
-            await query.edit_message_text(
-                f"📅 **Продлить подписку**\n\n"
-                f"Клиент: `{tg_id}`, подписка `{email}` (сейчас: {old})\n\n"
-                f"Отправь в чат команду:\n"
-                f"`/extendsub {tg_id} +30 {email}`\n\n"
-                f"Или с конкретной датой:\n"
-                f"`/extendsub {tg_id} 2027-01-01 {email}`",
-                parse_mode='Markdown',
-            )
-
-        elif action == "revoke":
-            preview_lines = [f"**Удалить клиента** `{tg_id}`:\n"]
-            for bb in bindings:
-                preview_lines.append(f"Подписка `{bb['email']}`")
-            preview_lines.append("\n⚠️ Клиент будет **удалён из панели** и БД.")
-            preview = "\n".join(preview_lines)
-            await _ask_confirm(
-                query.message.chat_id, context, "revoke",
-                {"tg_id": tg_id, "bindings": bindings}, preview,
             )
 
         else:
@@ -598,6 +619,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`/pausesub <tg_id> [email]` - ⏸️ Приостановить подписку\n"
             "`/resumesub <tg_id> [email]` - ▶️ Возобновить подписку\n"
             "`/extendsub <tg_id> <+N | дата> [email]` - 📅 Продлить подписку\n"
+            "`/broadcast [tg_id] <текст>` - 📢 Рассылка пользователям"
             "`/listclients` - 📋 Список выданных клиентов\n"
             "`/getlink <tg_id> [email]` - 🔗 Получить sub-ссылку клиента\n"
             "`/setcomment <tg_id> <email> <текст>` - 💬 Изменить комментарий\n"
@@ -827,6 +849,8 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _do_revoke(update, context, payload, query)
     elif action == "addclient":
         await _do_addclient(update, context, payload, query)
+    elif action == "broadcast":
+        await _do_broadcast(update, context, payload, query)
     else:
         await query.edit_message_text(f"❓ Неизвестное действие: {action}")
 
@@ -1611,9 +1635,79 @@ async def _do_revoke(update, context, payload, query) -> None:
 
     await _edit_query_safely(query, "\n".join(lines))
 
+
+async def _do_broadcast(update, context, payload, query) -> None:
+    """Выполняет рассылку после подтверждения."""
+    import asyncio
+
+    recipients = payload["recipients"]
+    message = payload["message"]
+    total = len(recipients)
+
+    delivered = 0
+    failed = 0
+    failed_ids = []
+
+    # Начальный прогресс
+    try:
+        await query.edit_message_text(f"📤 Отправляю... 0/{total}")
+    except Exception:
+        pass
+
+    for i, tg_id in enumerate(recipients, start=1):
+        try:
+            await context.bot.send_message(chat_id=tg_id, text=message, parse_mode='Markdown')
+            delivered += 1
+        except Exception as e:
+            err_str = str(e)
+            # Если Markdown сломался — пробуем без разметки
+            if "Can't parse entities" in err_str or "parse entities" in err_str.lower():
+                try:
+                    await context.bot.send_message(chat_id=tg_id, text=message)
+                    delivered += 1
+                except Exception as e2:
+                    failed += 1
+                    failed_ids.append(tg_id)
+                    logger.warning(f"[broadcast] Не доставлено {tg_id}: {e2}")
+            else:
+                failed += 1
+                failed_ids.append(tg_id)
+                logger.warning(f"[broadcast] Не доставлено {tg_id}: {e}")
+
+        # Обновляем прогресс каждые 50 отправок или на последнем
+        if i % 50 == 0 or i == total:
+            try:
+                await query.edit_message_text(f"📤 Отправляю... {i}/{total}")
+            except Exception:
+                pass
+
+        # Задержка 50 мс между отправками (не более 20 msg/sec)
+        if i < total:
+            await asyncio.sleep(0.05)
+
+    # Итоговый отчёт
+    lines = [
+        f"✅ **Рассылка завершена**\n",
+        f"**Доставлено: {delivered} из {total}**",
+        f"- Успешно: {delivered}",
+        f"- Не доставлено: {failed}",
+    ]
+    if failed_ids:
+        sample = failed_ids[:10]
+        lines.append(
+            f"\nПервые неудачные ID: "
+            f"`{', '.join(str(x) for x in sample)}`"
+        )
+        if len(failed_ids) > 10:
+            lines.append(f"...и ещё {len(failed_ids) - 10}")
+
+    try:
+        await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
+    except Exception:
+        await query.edit_message_text("\n".join(lines))
+
+
 # --- /getlink ---
-
-
 @admin_only
 async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Выдаёт sub-ссылку клиента админу по запросу."""
@@ -1837,7 +1931,6 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ---------- /sync ----------
 @superadmin_only
-@superadmin_only
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Синхронизирует БД из панели."""
     await update.message.reply_text("🔄 Запускаю синхронизацию. Это займёт несколько секунд...")
@@ -1865,6 +1958,68 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"переименовано {result['total_renamed']}, не найдено в панели {result['total_missing']}"
     )
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+@admin_only
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Рассылка сообщений пользователям бота."""
+    target_tg_id, message, error = _parse_broadcast_args(context.args or [])
+    if error:
+        await update.message.reply_text(
+            f"❌ {error}\n\n"
+            f"Примеры:\n"
+            f"`/broadcast Привет всем`\n"
+            f"`/broadcast 123456789 Привет Ивану`",
+            parse_mode='Markdown',
+        )
+        return
+
+    # Кому отправляем
+    if target_tg_id is None:
+        recipients = _get_broadcast_recipients_all()
+        recipient_desc = f"**всем** ({len(recipients)} получателей)"
+    else:
+        recipients = [target_tg_id]
+        recipient_desc = f"пользователю `{target_tg_id}`"
+
+    if not recipients:
+        await update.message.reply_text("Нет получателей для рассылки.")
+        return
+
+    # Инициатор — для прозрачности при двух админах
+    initiator = update.effective_user
+    init_name = initiator.full_name or initiator.username or str(initiator.id)
+
+    # Превью
+    preview_lines = [
+        f"**Рассылка**\n",
+        f"Кому: {recipient_desc}",
+        f"Инициатор: **{init_name}** (`{initiator.id}`)\n",
+        f"**Текст сообщения:**",
+        f"---",
+        message,
+        f"---",
+        f"\n⚠️ Сообщение будет отправлено **сразу** после нажатия «Да».",
+    ]
+
+    await _ask_confirm(
+        chat_id=update.effective_chat.id,
+        context=context,
+        action="broadcast",
+        payload={"recipients": recipients, "message": message},
+        preview="\n".join(preview_lines),
+    )
+
+
+def _get_broadcast_recipients_all() -> list:
+    """
+    Возвращает список tg_id для рассылки всем — включая админов.
+
+    Админы тоже получают — для фактчека: убедиться, что рассылка
+    действительно ушла и всё работает.
+    """
+    from database import list_bot_users
+    return [u["tg_id"] for u in list_bot_users()]
 
 
 async def _do_addclient(update, context, payload, query) -> None:
@@ -2239,6 +2394,33 @@ async def btn_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error(f"Не удалось уведомить админа {uid}: {e}")
 
 
+async def client_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-кнопка «🆘 Kömek gerek» из уведомления об истечении."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    full_name = user.full_name or "—"
+    username = f"@{user.username}" if user.username else "—"
+
+    await query.message.reply_text(
+        "🆘 Haýyşyňy administrada iberdim.\n"
+        "Ol tiz wagtyň içinde şahsy habarlaşar."
+    )
+
+    notif = (
+        f"🆘 **Клиент просит помощи**\n\n"
+        f"- Имя: {full_name}\n"
+        f"- Username: {username}\n"
+        f"- TG ID: `{user.id}`"
+    )
+    for uid in config.get_admin_users():
+        try:
+            await context.bot.send_message(chat_id=uid, text=notif, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Не удалось уведомить админа {uid}: {e}")
+
+
 # --- Диалог настройки панели ---
 SET_NAME, SET_URL, SET_USERNAME, SET_PASSWORD, SET_SUB_URL = range(5)
 
@@ -2358,15 +2540,23 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Логирует исключения в хендлерах и говорит пользователю, что что-то сломалось."""
+    """Логирует исключения в хендлерах. Отвечает админам и клиентам на их языке."""
     logger.error("Исключение при обработке апдейта:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ Внутренняя ошибка. Администратор уже видит её в логах."
-            )
-        except Exception:
-            pass
+
+    if not (isinstance(update, Update) and update.effective_message):
+        return
+
+    # По умолчанию — сообщение на туркменском (для клиентов)
+    text = "⚠️ Içki ýalňyşlyk. Administratorda ýüz tut."
+
+    # Админам — на русском
+    if update.effective_user and config.is_admin(update.effective_user.id):
+        text = "⚠️ Внутренняя ошибка. Администратор уже видит её в логах."
+
+    try:
+        await update.effective_message.reply_text(text)
+    except Exception:
+        pass
 
 
 async def post_init(application: Application) -> None:
@@ -2379,11 +2569,11 @@ async def post_init(application: Application) -> None:
       - админские команды — только в /help (не в меню).
     """
     commands = [
-        BotCommand("start", "🚀 Начать работу с ботом"),
-        BotCommand("help", "ℹ️ Справка"),
+        BotCommand("start", "🚀 Başlamak"),
+        BotCommand("help", "ℹ️ Kömek"),
     ]
     if config.get_policy_url():
-        commands.append(BotCommand("policy", "🔒 Политика конфиденциальности"))
+        commands.append(BotCommand("policy", "🔒 Gizlinlik syýasaty"))
     await application.bot.set_my_commands(commands)
 
 
@@ -2403,7 +2593,9 @@ def main() -> None:
         job_queue.run_daily(record_traffic_job, time=_scheduled_time(23, 50))
         report_hour = config.get_daily_report_hour()
         job_queue.run_daily(daily_report_job, time=_scheduled_time(report_hour))
-        job_queue.run_daily(expiry_notification_job, time=_scheduled_time(9, 0))
+        job_queue.run_daily(client_expiry_notification_job, time=_scheduled_time(9, 0))
+        job_queue.run_daily(client_expired_notification_job, time=_scheduled_time(23, 59))
+        job_queue.run_daily(admin_expired_notification_job, time=_scheduled_time(6, 0))
         job_queue.run_daily(auto_sync_job, time=_scheduled_time(0, 1))
     else:
         logger.warning("JobQueue не инициализирован.")
@@ -2454,6 +2646,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(apply_callback, pattern=r"^apply:submit$"))
     application.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admact:"))
     application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
+    application.add_handler(CallbackQueryHandler(client_help_callback, pattern=r"^client:help$"))
 
     # cancel_input — обычная команда, группа 0
     application.add_handler(CommandHandler("cancel_input", cancel_input_command))
@@ -2487,6 +2680,7 @@ def main() -> None:
     application.add_handler(CommandHandler("setcomment", setcomment_command))
     application.add_handler(CommandHandler("rename", rename_command))
     application.add_handler(CommandHandler("sync", sync_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("pausesub", pausesub_command))
     application.add_handler(CommandHandler("resumesub", resumesub_command))
     application.add_handler(CommandHandler("extendsub", extendsub_command))
