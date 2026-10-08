@@ -34,6 +34,21 @@ from xui_api import XUIApi
 logger = logging.getLogger(__name__)
 
 
+# ---------- HTML-экранирование для Telegram ----------
+
+import html as _html_module
+
+
+def _esc(text) -> str:
+    """
+    Экранирует < > & для безопасной вставки в HTML-разметку Telegram.
+    Возвращает '' при None.
+    """
+    if text is None:
+        return ""
+    return _html_module.escape(str(text))
+
+
 # ---------- Константы ----------
 
 # Допустимые символы email: латиница, цифры, точка, дефис, подчёркивание
@@ -59,7 +74,7 @@ def _format_bytes(size: int) -> str:
     power = 1024
     n = 0
     power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power and n < len(power_labels) - 1:
+    while size >= power and n < len(power_labels) - 1:
         size /= power
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
@@ -170,7 +185,7 @@ def _parse_expiry_input(text: str) -> tuple:
     try:
         parsed_naive = datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
-        return None, None, "Не понял формат. Введи дату `ГГГГ-ММ-ДД`, или нажми кнопку, или `/skip`."
+        return None, None, "Не понял формат. Введи дату <code>ГГГГ-ММ-ДД</code>, или нажми кнопку, или <code>/skip</code>."
 
     now = datetime.now(_tz())
     if parsed_naive.date() < now.date():
@@ -222,7 +237,7 @@ def _parse_extend_argument(text: str) -> tuple:
     try:
         parsed = datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
-        return None, None, "Введи `+N` (дней) или дату `ГГГГ-ММ-ДД`."
+        return None, None, "Введи <code>+N</code> (дней) или дату <code>ГГГГ-ММ-ДД</code>."
 
     if parsed.date() < datetime.now().date():
         return None, None, "Дата уже прошла."
@@ -294,7 +309,7 @@ async def _ask_confirm(
 
     :param action: 'pause' | 'resume' | 'extend' | 'revoke' | 'addclient'
     :param payload: данные, нужные для выполнения действия
-    :param preview: текст превью (Markdown)
+    :param preview: текст превью (HTML)
     """
     token = secrets.token_hex(4)
     context.user_data['pending'] = {
@@ -304,32 +319,32 @@ async def _ask_confirm(
     }
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"⚠️ **Подтверди действие**\n\n{preview}",
-        parse_mode='Markdown',
+        text=f"⚠️ <b>Подтверди действие</b>\n\n{preview}",
+        parse_mode='HTML',
         reply_markup=_confirm_keyboard(token),
     )
 
 
 def _render_binding_line(panel_name: str, email: str, mark: str, extra: str = "") -> str:
-    """Строка отчёта вида: Подписка `user123` — ✅ возобновлена (+30 дн., до 2026-XX-XX)"""
-    base = f"Подписка `{email}` — {mark}"
+    """Строка отчёта в HTML: Подписка <code>user123</code> — ✅ возобновлена (+30 дн.)"""
+    base = f"Подписка <code>{_esc(email)}</code> — {mark}"
     if extra:
         base += f" {extra}"
     return base
 
 
 async def _send_client_notice(context: ContextTypes.DEFAULT_TYPE, tg_id: int, text: str) -> None:
-    """Отправляет клиенту уведомление с защитой от ошибок."""
+    """Отправляет клиенту уведомление (HTML) с защитой от ошибок."""
     try:
-        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')
+        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='HTML')
     except Exception as e:
         logger.warning(f"Не удалось уведомить клиента {tg_id}: {e}")
 
 
 async def _edit_query_safely(query, text: str) -> None:
-    """Редактирует сообщение с защитой от «текст не изменился»."""
+    """Редактирует сообщение (HTML) с защитой от «текст не изменился»."""
     try:
-        await query.edit_message_text(text, parse_mode='Markdown')
+        await query.edit_message_text(text, parse_mode='HTML')
     except Exception as e:
         logger.debug(f"edit_message_text: {e}")
 
@@ -395,7 +410,7 @@ def _render_admin_action_page(
     page: int,
     page_size: int = ADMIN_ACTION_PAGE_SIZE,
 ) -> tuple:
-    """Возвращает (text, keyboard) для страницы выбора клиента."""
+    """Возвращает (HTML-текст, keyboard) для страницы выбора клиента."""
     total = len(bindings)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
@@ -405,12 +420,13 @@ def _render_admin_action_page(
     chunk = bindings[start:end]
 
     title = _ADMIN_ACTION_TITLES.get(action, action)
-    lines = [f"**{title}** (страница {page + 1}/{total_pages}):\n"]
+    lines = [f"<b>{_esc(title)}</b> (страница {page + 1}/{total_pages}):\n"]
     for b in chunk:
         expiry = b.get("expiry_date") or "бессрочно"
         status_icon = "⏸️" if b.get("paused_at") else "▶️"
         lines.append(
-            f"{status_icon} `{b['panel_name']}` 👤 `{b['email']}` — до `{expiry}`"
+            f"{status_icon} <code>{_esc(b['panel_name'])}</code> "
+            f"👤 <code>{_esc(b['email'])}</code> — до <code>{_esc(expiry)}</code>"
         )
 
     text = "\n".join(lines)
@@ -432,7 +448,7 @@ def _parse_broadcast_args(args: list) -> tuple:
       error — str или None при ошибке
     """
     if not args:
-        return None, None, "Формат: `/broadcast [tg_id] <текст>`"
+        return None, None, "Формат: <code>/broadcast [tg_id] &#60;текст&#62;</code>"
 
     # Первое слово — число? Тогда это target_tg_id
     target_tg_id = None

@@ -110,9 +110,22 @@ def get_admin_users() -> List[int]:
 def is_admin(user_id: int) -> bool:
     return user_id in get_admin_users()
 
+
+def get_normal_users() -> List[int]:
+    """Обычные пользователи (users.normal_users)."""
+    users = config.get("users", {}).get("normal_users") or []
+    if not isinstance(users, list):
+        users = [users] if users else []
+    result = []
+    for u in users:
+        try:
+            result.append(int(u))
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
 # ---------- Панели ----------
-
-
 def get_panel_config(name: str) -> Dict[str, str]:
     """Возвращает конфигурацию панели по имени."""
     return config.get("panels", {}).get(name, {})
@@ -182,8 +195,12 @@ def get_daily_report_hour() -> int:
     return hour
 
 
-# ---------- Учёт трафика ----------
+def is_monthly_reset_enabled() -> bool:
+    """Флаг monthly_reset.enable в config.yml."""
+    return config.get("monthly_reset", {}).get("enable", False)
 
+
+# ---------- Учёт трафика ----------
 def get_accounting_mode() -> str:
     """'unidirectional' или 'bidirectional'. По умолчанию — первый."""
     mode = config.get("traffic", {}).get("accounting_mode", "unidirectional")

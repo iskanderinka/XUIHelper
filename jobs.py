@@ -32,7 +32,7 @@ from database import (
     update_binding_limit_hwid, update_binding_expiry,
     update_binding_enabled, rename_traffic_email,
 )
-from helpers import _bytes_to_gb, _tz, _get_panel_api
+from helpers import _bytes_to_gb, _tz, _get_panel_api, _esc
 from xui_api import _parse_settings
 
 logger = logging.getLogger(__name__)
@@ -70,11 +70,11 @@ async def record_traffic_job(context: ContextTypes.DEFAULT_TYPE):
 
 def _format_daily_report_text(report_date: str, stats: list,
                               panel_stats: list, top_users_by_panel: dict) -> str:
-    """Форматирует дневной отчёт: список пользователей отдельно по каждой панели."""
+    """Форматирует дневной отчёт (HTML)."""
     if not stats and not panel_stats:
         return (
-            f"📊 **Дневной отчёт по трафику ({report_date})**\n\n"
-            "**Данные за день недоступны**\n"
+            f"📊 <b>Дневной отчёт по трафику ({_esc(report_date)})</b>\n\n"
+            "<b>Данные за день недоступны</b>\n"
             "- Причина: отсутствует снимок трафика за предыдущий день, "
             "точный расход посчитать нельзя."
         )
@@ -84,26 +84,26 @@ def _format_daily_report_text(report_date: str, stats: list,
     total_traffic = total_upload + total_download
 
     lines = [
-        f"📊 **Дневной отчёт по трафику ({report_date})**\n",
-        f"**Общий расход**: {_bytes_to_gb(total_traffic)} GB",
+        f"📊 <b>Дневной отчёт по трафику ({_esc(report_date)})</b>\n",
+        f"<b>Общий расход</b>: {_bytes_to_gb(total_traffic)} GB",
         f"  - Отдано: {_bytes_to_gb(total_upload)} GB",
         f"  - Принято: {_bytes_to_gb(total_download)} GB\n",
     ]
 
     if panel_stats:
-        lines.append("**Расход по панелям:**")
+        lines.append("<b>Расход по панелям:</b>")
         for ps in panel_stats:
-            lines.append(f"  - {ps['panel_name']}: {_bytes_to_gb(ps['daily_total'])} GB")
+            lines.append(f"  - {_esc(ps['panel_name'])}: {_bytes_to_gb(ps['daily_total'])} GB")
         lines.append("")
 
     for panel_name in (ps["panel_name"] for ps in panel_stats):
         panel_users = top_users_by_panel.get(panel_name, [])
         if not panel_users:
             continue
-        lines.append(f"**{panel_name}: Топ 10 пользователей по расходу:**")
+        lines.append(f"<b>{_esc(panel_name)}: Топ 10 пользователей по расходу:</b>")
         for i, user in enumerate(panel_users[:10], 1):
             lines.append(
-                f"  {i}. {user['email']} ({panel_name}): "
+                f"  {i}. {_esc(user['email'])} ({_esc(panel_name)}): "
                 f"{_bytes_to_gb(user['total_usage'])} GB"
             )
         lines.append("")
@@ -142,13 +142,12 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     report_text = await _generate_daily_report_text()
     for uid in config.get_admin_users():
         try:
-            await context.bot.send_message(chat_id=uid, text=report_text, parse_mode='Markdown')
+            await context.bot.send_message(chat_id=uid, text=report_text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Не удалось отправить отчёт {uid}: {e}")
 
 
 # ---------- Проверка связи с панелями и истечений инбаундов ----------
-
 async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет истекающие инбаунды и статус панелей."""
     logger.info("Запуск задачи: check_inbounds_job")
@@ -170,11 +169,11 @@ async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(
                             chat_id=uid,
-                            text=f"🚨 **Панель '{name}' недоступна**",
-                            parse_mode='Markdown'
+                            text=f"🚨 <b>Панель '{_esc(name)}' недоступна</b>",
+                            parse_mode='HTML'
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Не удалось отправить алерт {uid}: {e}")
                 continue
             inbounds_data = await api.get_inbounds()
 
@@ -190,17 +189,17 @@ async def check_inbounds_job(context: ContextTypes.DEFAULT_TYPE):
                         expiry_ts / 1000, _tz()
                     ).strftime('%Y-%m-%d')
                     message = (
-                        f"🔔 **Напоминание об истечении ({name})** 🔔\n"
-                        f"- Описание: {inbound.get('remark', 'N/A')}\n"
-                        f"- Истекает: {expiry_date}"
+                        f"🔔 <b>Напоминание об истечении ({_esc(name)})</b> 🔔\n"
+                        f"- Описание: {_esc(inbound.get('remark', 'N/A'))}\n"
+                        f"- Истекает: {_esc(expiry_date)}"
                     )
                     for uid in admin_users:
                         try:
                             await context.bot.send_message(
-                                chat_id=uid, text=message, parse_mode='Markdown'
+                                chat_id=uid, text=message, parse_mode='HTML'
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Не удалось отправить алерт {uid}: {e}")
 
 
 # ---------- Напоминания клиентам об истечении подписки ----------
@@ -215,13 +214,13 @@ async def _send_client_expiry_notice(
 ) -> None:
     """Отправляет клиенту напоминание о скором истечении подписки."""
     text = (
-        f"⏰ **Abuna barada ýatlatma**\n\n"
-        f"Seniň abunaň **{days_left} gün** içinde gutarýar — "
-        f"**{expiry_str}** çenli.\n\n"
+        f"⏰ <b>Abuna barada ýatlatma</b>\n\n"
+        f"Seniň abunaň <b>{days_left} gün</b> içinde gutarýar — "
+        f"<b>{_esc(expiry_str)}</b> çenli.\n\n"
         f"Möhleti wagtynda uzaltmak barada alada et."
     )
     try:
-        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='Markdown')
+        await context.bot.send_message(chat_id=tg_id, text=text, parse_mode='HTML')
     except Exception as e:
         logger.warning(f"Не удалось отправить напоминание клиенту {tg_id}: {e}")
 
@@ -236,16 +235,16 @@ async def _notify_admins_expired(
 ) -> None:
     """Отправляет всем админам уведомление об истёкшей подписке."""
     text = (
-        f"❌ **Подписка истекла**\n\n"
-        f"Клиент: `{tg_id}`\n"
-        f"Панель: `{panel_name}`\n"
-        f"Email: `{email}`\n"
-        f"Истекла: `{expiry_str}`\n\n"
-        f"Отозвать: `/revoke {tg_id} {email}`"
+        f"❌ <b>Подписка истекла</b>\n\n"
+        f"Клиент: <code>{tg_id}</code>\n"
+        f"Панель: <code>{_esc(panel_name)}</code>\n"
+        f"Email: <code>{_esc(email)}</code>\n"
+        f"Истекла: <code>{_esc(expiry_str)}</code>\n\n"
+        f"Отозвать: <code>/revoke {tg_id} {_esc(email)}</code>"
     )
     for uid in admin_users:
         try:
-            await context.bot.send_message(chat_id=uid, text=text, parse_mode='Markdown')
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Не удалось уведомить админа {uid}: {e}")
 
@@ -525,22 +524,22 @@ async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE):
     if not (result["total_updated"] or result["total_renamed"] or result["total_missing"]):
         return
 
-    lines = ["🔄 **Автосинхронизация БД с панелями**\n"]
+    lines = ["🔄 <b>Автосинхронизация БД с панелями</b>\n"]
     for d in result["details"]:
         if d["status"] == "ok":
             lines.append(
-                f"**{d['panel_name']}**: обновлено {d['updated']}, "
+                f"<b>{_esc(d['panel_name'])}</b>: обновлено {d['updated']}, "
                 f"переименовано {d['renamed']}, потеряно {d['missing']}"
             )
         elif d["status"] == "disabled":
-            lines.append(f"⏭️ **{d['panel_name']}**: отключена")
+            lines.append(f"⏭️ <b>{_esc(d['panel_name'])}</b>: отключена")
         elif d["status"] == "error":
-            lines.append(f"❌ **{d['panel_name']}**: ошибка связи")
+            lines.append(f"❌ <b>{_esc(d['panel_name'])}</b>: ошибка связи")
 
     text = "\n".join(lines)
     for uid in config.get_admin_users():
         try:
-            await context.bot.send_message(chat_id=uid, text=text, parse_mode='Markdown')
+            await context.bot.send_message(chat_id=uid, text=text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"[auto_sync] Не удалось уведомить {uid}: {e}")
 
@@ -554,8 +553,8 @@ async def _send_client_expired_notice(
 ) -> None:
     """Уведомляет клиента, что подписка истекла, с inline-кнопкой «Нужна помощь»."""
     text = (
-        f"⏰ **Abunaňyz gutardy**\n\n"
-        f"**{expiry_str}** senesinde abunaňyz gutardy.\n\n"
+        f"⏰ <b>Abunaňyz gutardy</b>\n\n"
+        f"<b>{_esc(expiry_str)}</b> senesinde abunaňyz gutardy.\n\n"
         f"Eger bu ýalňyşlyk bilen bolan bolsa ýa-da abunany uzaltmak isleseňiz — "
         f"biz bilen habarlaşyň."
     )
@@ -566,7 +565,7 @@ async def _send_client_expired_notice(
         await context.bot.send_message(
             chat_id=tg_id,
             text=text,
-            parse_mode='Markdown',
+            parse_mode='HTML',
             reply_markup=keyboard,
         )
     except Exception as e:

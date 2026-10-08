@@ -255,8 +255,23 @@ def has_daily_traffic_snapshot(record_date: str) -> bool:
     return row is not None
 
 
-# ---------- bot_users: кто запускал бота ----------
+def get_date_range() -> Optional[tuple]:
+    """
+    Возвращает (min_record_date, max_record_date) по traffic_records.
+    None, если записей нет.
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT MIN(record_date) AS min_d, MAX(record_date) AS max_d "
+        "FROM traffic_records"
+    ).fetchone()
+    conn.close()
+    if row and row["min_d"]:
+        return (row["min_d"], row["max_d"])
+    return None
 
+
+# ---------- bot_users: кто запускал бота ----------
 def upsert_bot_user(tg_id: int, username: str = "", first_name: str = "") -> None:
     """Записывает или обновляет информацию о пользователе, запустившем бота."""
     conn = _get_conn()
@@ -280,6 +295,24 @@ def is_bot_user(tg_id: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def get_bot_user(tg_id: int) -> Optional[Dict]:
+    """Возвращает запись bot_users или None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM bot_users WHERE tg_id = ?", (int(tg_id),)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_bot_users() -> List[Dict]:
+    """Все пользователи, когда-либо запускавшие бота."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM bot_users ORDER BY tg_id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ---------- client_bindings: связки клиентов ----------
@@ -520,56 +553,6 @@ def update_binding_comment(tg_id: int, panel_name: str, email: str,
     )
     conn.commit()
     conn.close()
-
-
-def update_binding_limit_hwid(tg_id: int, panel_name: str, email: str,
-                               new_limit: int) -> None:
-    """Обновляет HWID-лимит в связке."""
-    conn = _get_conn()
-    conn.execute(
-        """UPDATE client_bindings SET limit_hwid = ?
-           WHERE tg_id = ? AND panel_name = ? AND email = ?""",
-        (int(new_limit), int(tg_id), panel_name, email),
-    )
-    conn.commit()
-    conn.close()
-
-
-def update_binding_email(tg_id: int, panel_name: str, old_email: str,
-                          new_email: str) -> bool:
-    """
-    Меняет email в связке.
-
-    Возвращает True при успехе, False если новый email уже занят
-    (нарушение PRIMARY KEY).
-    """
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """UPDATE client_bindings SET email = ?
-               WHERE tg_id = ? AND panel_name = ? AND email = ?""",
-            (new_email, int(tg_id), panel_name, old_email),
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-
-def rename_traffic_email(panel_name: str, old_email: str, new_email: str) -> int:
-    """Переписывает email в traffic_records. Возвращает число обновлённых строк."""
-    conn = _get_conn()
-    cursor = conn.execute(
-        """UPDATE traffic_records SET email = ?
-           WHERE panel_name = ? AND email = ?""",
-        (new_email, panel_name, old_email),
-    )
-    updated = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return updated
 
 
 def update_binding_enabled(tg_id: int, panel_name: str, email: str, enabled: bool) -> None:
