@@ -1,9 +1,11 @@
 import html
 import logging
+from urllib.parse import unquote
 import uuid as uuid_module
 from functools import wraps
 from datetime import datetime, timedelta, time
 from typing import Optional
+from audit import audit_log, audit_command
 
 from telegram import (
     Update, BotCommand,
@@ -657,6 +659,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- Админские команды по панелям ---
+@audit_command("/status")
 @admin_only
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Подробный статус одной панели. Без аргумента — подсказка."""
@@ -719,6 +722,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"Не удалось получить полный статус '{panel_name}'. Проверьте подключение или повторите позже.")
 
 
+@audit_command("/inbounds")
 @admin_only
 async def inbounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает список инбаундов панели с их ID."""
@@ -758,6 +762,7 @@ async def inbounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 
+@audit_command("/listpanels")
 @admin_only
 async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Список всех панелей с их текущим статусом."""
@@ -791,6 +796,7 @@ async def listpanels_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 
+@audit_command("/delpanel")
 @superadmin_only
 async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -951,6 +957,7 @@ AC_EXPIRY = 2
 AC_COMMENT = 3
 
 
+@audit_command("/addclient")
 @admin_only
 async def addclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Отменяем параллельный диалог /setting
@@ -1232,9 +1239,9 @@ async def addclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("Создание клиента отменено.")
     return ConversationHandler.END
 
+
 # --- /pausesub ---
-
-
+@audit_command("/pausesub")
 @admin_only
 async def pausesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на постановку подписки на паузу."""
@@ -1320,9 +1327,9 @@ async def _do_pause(update, context, payload, query) -> None:
             "Administrator bilen habarlaşmak: 🆘 Kömek gerek"
         )
 
+
 # --- /resumesub ---
-
-
+@audit_command("/resumesub")
 @admin_only
 async def resumesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на возобновление подписки."""
@@ -1439,6 +1446,7 @@ async def _do_resume(update, context, payload, query) -> None:
 
 
 # --- /extendsub ---
+@audit_command("/extendsub")
 @admin_only
 async def extendsub_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на продление подписки."""
@@ -1566,6 +1574,7 @@ async def _do_extend(update, context, payload, query) -> None:
 
 
 # --- /revoke и /listclients ---
+@audit_command("/revoke")
 @admin_only
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает подтверждение на удаление клиента."""
@@ -1708,6 +1717,7 @@ async def _do_broadcast(update, context, payload, query) -> None:
 
 
 # --- /getlink ---
+@audit_command("/getlink")
 @admin_only
 async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запрашивает: выдать sub-ссылку или ссылки на конфиги."""
@@ -1902,7 +1912,7 @@ async def _getlink_send_configs(
             # Анкор (после #) — это имя вида "🇹🇲 Acar_VL_R-prk000"
             name = ""
             if "#" in link:
-                name = link.split("#", 1)[1]
+                name = unquote(link.split("#", 1)[1])
             name_line = f"\n<b>{i}. {_esc(name)}</b>" if name else f"\n<b>{i}.</b>"
             lines.append(f"{name_line}\n<code>{_esc(link)}</code>")
 
@@ -1932,7 +1942,7 @@ async def _getlink_send_configs(
             for i, link in enumerate(links, 1):
                 name = ""
                 if "#" in link:
-                    name = link.split("#", 1)[1]
+                    name = unquote(link.split("#", 1)[1])
                 name_line = f"<b>{i}. {_esc(name)}</b>" if name else f"<b>{i}.</b>"
                 try:
                     await context.bot.send_message(
@@ -1945,6 +1955,7 @@ async def _getlink_send_configs(
 
 
 # ---------- /setcomment ----------
+@audit_command("/setcomment")
 @admin_only
 async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Меняет комментарий клиента — и в БД, и в панели."""
@@ -2010,6 +2021,7 @@ async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ---------- /rename ----------
+@audit_command("/rename")
 @admin_only
 async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Меняет email клиента — и в БД, и в панели, и в истории трафика."""
@@ -2106,6 +2118,7 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------- /sync ----------
+@audit_command("/sync")
 @superadmin_only
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Синхронизирует БД из панели."""
@@ -2136,6 +2149,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 
+@audit_command("/sync")
 @admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Рассылка сообщений пользователям бота."""
@@ -2601,6 +2615,7 @@ async def client_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 SET_NAME, SET_URL, SET_USERNAME, SET_PASSWORD, SET_SUB_URL = range(5)
 
 
+@audit_command("/setting")
 @superadmin_only
 async def setting_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Отменяем параллельный диалог /addclient
@@ -2709,6 +2724,7 @@ async def cancel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+@audit_command("/report")
 @admin_only
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     report_text = await _generate_daily_report_text()
