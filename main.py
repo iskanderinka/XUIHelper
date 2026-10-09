@@ -1710,7 +1710,7 @@ async def _do_broadcast(update, context, payload, query) -> None:
 # --- /getlink ---
 @admin_only
 async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Выдаёт sub-ссылку клиента админу по запросу."""
+    """Запрашивает: выдать sub-ссылку или ссылки на конфиги."""
     if not context.args:
         await update.message.reply_text("Формат: /getlink <tg_id> [email]")
         return
@@ -1734,6 +1734,78 @@ async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(err)
             return
 
+    # Сохраняем список в user_data — понадобится в callback
+    context.user_data["getlink_bindings"] = bindings
+    context.user_data["getlink_tg_id"] = tg_id
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Ссылка на подписку", callback_data="getlink:sub")],
+        [InlineKeyboardButton("🧩 Ссылки на все конфигурации", callback_data="getlink:confs")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="getlink:cancel")],
+    ])
+
+    await update.message.reply_text(
+        f"🔗 <b>Что выдать для клиента</b> <code>{tg_id}</code>?\n"
+        f"Найдено подписок: <b>{len(bindings)}</b>\n\n"
+        f"<i>«Ссылка на подписку» — приложение само подтянет список серверов "
+        f"(может не работать при блокировках провайдера).\n"
+        f"«Ссылки на все конфигурации» — прямые ссылки на каждый инбаунд, "
+        f"которые можно импортировать по одной.</i>",
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
+
+
+async def getlink_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает выбор: sub-ссылка или конфиги."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+
+    if data == "getlink:cancel":
+        try:
+            await query.edit_message_text("❌ Отменено.")
+        except Exception:
+            pass
+        context.user_data.pop("getlink_bindings", None)
+        context.user_data.pop("getlink_tg_id", None)
+        return
+
+    bindings = context.user_data.get("getlink_bindings")
+    tg_id = context.user_data.get("getlink_tg_id")
+
+    if not bindings or tg_id is None:
+        try:
+            await query.edit_message_text(
+                "⚠️ Список устарел (бот перезапускался). Запусти /getlink снова."
+            )
+        except Exception:
+            pass
+        return
+
+    # Убираем сообщение с кнопками — оно больше не нужно
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    if data == "getlink:sub":
+        await _getlink_send_sub(query.message.chat_id, context, tg_id, bindings)
+    elif data == "getlink:confs":
+        await _getlink_send_configs(query.message.chat_id, context, tg_id, bindings)
+
+    context.user_data.pop("getlink_bindings", None)
+    context.user_data.pop("getlink_tg_id", None)
+
+
+async def _getlink_send_sub(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_id: int,
+    bindings: list,
+) -> None:
+    """Отправляет sub-ссылку по каждой связке (как раньше)."""
     lines = [f"🔗 <b>Ссылки клиента</b> <code>{tg_id}</code>:\n"]
     for b in bindings:
         panel_name = b["panel_name"]
@@ -1758,13 +1830,118 @@ async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if sub_url:
             link = f"{sub_url}/{b['sub_id']}"
-            lines.append(f"<b>{_esc(panel_name)}</b> ({_esc(email)}) — {status}:\n<code>{_esc(link)}</code>{warn_line}\n")
+            lines.append(
+                f"<b>{_esc(panel_name)}</b> ({_esc(email)}) — {status}:\n"
+                f"<code>{_esc(link)}</code>{warn_line}\n"
+            )
         else:
             lines.append(
-                f"<b>{_esc(panel_name)}</b> ({_esc(email)}) — {status}: sub_url не настроен\n"
+                f"<b>{_esc(panel_name)}</b> ({_esc(email)}) — {status}: "
+                f"sub_url не настроен\n"
             )
 
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode='HTML')
+
+
+async def _getlink_send_configs(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_id: int,
+    bindings: list,
+) -> None:
+    """Отправляет по одному сообщению на каждую связку со списком конфигов."""
+    for b in bindings:
+        panel_name = b["panel_name"]
+        email = b["email"]
+        status = "⏸️ приостановлена" if b.get("paused_at") else "▶️ активна"
+
+        links = None
+        error_note = ""
+        try:
+            async with _get_panel_api(panel_name) as api:
+                ok = await api.login()
+                if not ok:
+                    error_note = "❌ Не удалось подключиться к панели."
+                else:
+                    links = await api.get_client_links(email)
+        except Exception as e:
+            logger.error(f"[getlink] Ошибка загрузки конфигов '{panel_name}/{email}': {e}")
+            error_note = f"❌ Ошибка: {_esc(str(e))}"
+
+        header = (
+            f"🧩 <b>Конфигурации клиента</b> <code>{tg_id}</code>\n"
+            f"Панель: <b>{_esc(panel_name)}</b>\n"
+            f"Подписка: <code>{_esc(email)}</code> — {status}\n"
+        )
+
+        if error_note:
+            await context.bot.send_message(
+                chat_id=chat_id, text=header + "\n" + error_note, parse_mode='HTML'
+            )
+            continue
+
+        if links is None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header + "\n⚠️ Панель не отдала конфигурации. Попробуй позже.",
+                parse_mode='HTML',
+            )
+            continue
+
+        if not links:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header + "\n⚠️ Клиент не привязан ни к одному инбаунду.",
+                parse_mode='HTML',
+            )
+            continue
+
+        # Собираем сообщение: по одному пункту на конфиг
+        lines = [header, f"Найдено конфигов: <b>{len(links)}</b>\n"]
+        for i, link in enumerate(links, 1):
+            # Анкор (после #) — это имя вида "🇹🇲 Acar_VL_R-prk000"
+            name = ""
+            if "#" in link:
+                name = link.split("#", 1)[1]
+            name_line = f"\n<b>{i}. {_esc(name)}</b>" if name else f"\n<b>{i}.</b>"
+            lines.append(f"{name_line}\n<code>{_esc(link)}</code>")
+
+        text = "\n".join(lines)
+
+        # Telegram не пропустит > 4096. Делим, если не влезло.
+        if len(text) <= 4000:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.error(f"[getlink] Не удалось отправить конфиги: {e}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=header + "\n⚠️ Не удалось отправить конфигурации. Проверь логи.",
+                    parse_mode='HTML',
+                )
+        else:
+            # Шлём шапку отдельно, потом по одному конфигу отдельным сообщением
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header + f"\nНайдено конфигов: <b>{len(links)}</b>\n"
+                              f"<i>Из-за размера шлём по одному.</i>",
+                parse_mode='HTML',
+            )
+            for i, link in enumerate(links, 1):
+                name = ""
+                if "#" in link:
+                    name = link.split("#", 1)[1]
+                name_line = f"<b>{i}. {_esc(name)}</b>" if name else f"<b>{i}.</b>"
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{name_line}\n<code>{_esc(link)}</code>",
+                        parse_mode='HTML',
+                    )
+                except Exception as e:
+                    logger.error(f"[getlink] Не удалось отправить конфиг #{i}: {e}")
 
 
 # ---------- /setcomment ----------
@@ -2646,6 +2823,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admact:"))
     application.add_handler(CallbackQueryHandler(clients_nav_callback, pattern=r"^clients:"))
     application.add_handler(CallbackQueryHandler(client_help_callback, pattern=r"^client:help$"))
+    application.add_handler(CallbackQueryHandler(getlink_callback, pattern=r"^getlink:"))
 
     # cancel_input — обычная команда, группа 0
     application.add_handler(CommandHandler("cancel_input", cancel_input_command))

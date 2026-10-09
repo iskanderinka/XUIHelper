@@ -35,6 +35,7 @@ class XUIApi:
       - URL панели может содержать кастомный base-path (например, /x8UGpUW143YI9P3JVyQm).
     """
 
+
     def __init__(self, url: str, username: str, password: str, sub_url: str = ""):
         self.base_url = url.rstrip('/')
         self.sub_url = (sub_url or "").rstrip('/')
@@ -44,6 +45,7 @@ class XUIApi:
         self.client = httpx.AsyncClient(verify=verify, timeout=30, follow_redirects=True)
         self.csrf_token: Optional[str] = None
         self._logged_in = False
+
 
     def _resolve_verify_setting(self):
         """
@@ -79,16 +81,16 @@ class XUIApi:
     async def aclose(self):
         await self.client.aclose()
 
-    # ---- Заголовки ----
 
+    # ---- Заголовки ----
     def _headers(self, method: str) -> Dict[str, str]:
         headers = {"X-Requested-With": "XMLHttpRequest"}
         if method.upper() != "GET" and self.csrf_token:
             headers["X-Csrf-Token"] = self.csrf_token
         return headers
 
-    # ---- CSRF и логин ----
 
+    # ---- CSRF и логин ---
     async def _bootstrap(self) -> bool:
         """GET / — сервер выдаёт cookie и HTML с CSRF-токеном."""
         try:
@@ -107,6 +109,7 @@ class XUIApi:
         except httpx.RequestError as e:
             logger.error(f"Bootstrap: ошибка сети: {e}")
             return False
+
 
     async def login(self) -> bool:
         """Полный цикл входа: GET / → POST /login → GET /."""
@@ -143,13 +146,14 @@ class XUIApi:
             logger.error(f"Логин: {e}")
             return False
 
+
     async def _ensure_session(self) -> bool:
         if not self._logged_in:
             return await self.login()
         return True
 
-    # ---- Универсальный запрос ----
 
+    # ---- Универсальный запрос ----
     async def _request(self, method: str, path: str,
                        json_body: Optional[Dict] = None) -> Optional[Dict]:
         url = f"{self.base_url}{path}"
@@ -180,8 +184,8 @@ class XUIApi:
             logger.error(f"Ошибка запроса {method} {path}: {e}")
             return None
 
-    # ---- Инбаунды ----
 
+    # ---- Инбаунды ----
     async def get_inbounds(self) -> Optional[Dict[str, Any]]:
         """Сырой ответ /panel/api/inbounds/list (используется задачами)."""
         if not await self._ensure_session():
@@ -205,8 +209,8 @@ class XUIApi:
             for ib in (data.get("obj") or [])
         ]
 
-    # ---- Статус сервера ----
 
+    # ---- Статус сервера ----
     async def get_server_status(self) -> Optional[Dict[str, Any]]:
         """Статус сервера (CPU, RAM, диск, Xray и т.д.)."""
         if not await self._ensure_session():
@@ -214,8 +218,8 @@ class XUIApi:
         data = await self._request("GET", "/panel/api/server/status")
         return data.get("obj") if data else None
 
-    # ---- Все клиенты ----
 
+    # ---- Все клиенты ----
     async def get_all_clients(self) -> List[Dict[str, Any]]:
         """Плоский список всех клиентов всех инбаундов."""
         data = await self.get_inbounds()
@@ -232,6 +236,7 @@ class XUIApi:
                     "expiryTime": cs.get("expiryTime", 0),
                 })
         return clients
+
 
     # ---- Создание клиента ----
     async def create_client(
@@ -287,8 +292,8 @@ class XUIApi:
         logger.error(f"Ошибка создания клиента '{email}': {data}")
         return False
 
-    # ---- Удаление клиента ----
 
+    # ---- Удаление клиента ----
     async def delete_client(self, email: str) -> bool:
         """Удаляет клиента по email (панель сама найдёт его во всех инбаундах)."""
         if not await self._ensure_session():
@@ -301,8 +306,30 @@ class XUIApi:
         logger.error(f"Ошибка удаления клиента '{email}': {data}")
         return False
 
-    # ---- Получение полного объекта клиента ----
 
+    async def get_client_links(self, email: str) -> Optional[List[str]]:
+        """
+        Возвращает список готовых конфиг-ссылок клиента (vless://, hysteria2:// и т.д.).
+
+        Один элемент массива = одна ссылка на один инбаунд.
+        Возвращает:
+          - список строк — успех (может быть пустым, если клиент не привязан к инбаундам),
+          - [] — клиент есть, но ссылок нет,
+          - None — ошибка сессии/сети/API.
+        """
+        if not await self._ensure_session():
+            return None
+        safe_email = url_quote(email, safe="")
+        data = await self._request("GET", f"/panel/api/clients/links/{safe_email}")
+        if not data:
+            return None
+        if not data.get("success"):
+            logger.error(f"get_client_links '{email}': {data.get('msg') or 'нет msg'}")
+            return None
+        return data.get("obj") or []
+
+
+    # ---- Получение полного объекта клиента ----
     async def get_client_object(self, email: str) -> Optional[Dict[str, Any]]:
         """
         Возвращает полный объект клиента из панели.
@@ -425,8 +452,8 @@ class XUIApi:
         logger.error(f"Ошибка обновления клиента '{email}': {data}")
         return None
 
-    # ---- Sub-ссылка ----
 
+    # ---- Sub-ссылка ----
     def get_client_sub_link(self, sub_id: str) -> Optional[str]:
         """Возвращает полную ссылку подписки."""
         if not self.sub_url:
