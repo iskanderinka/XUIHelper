@@ -2323,7 +2323,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-@audit_command("/sync")
+@audit_command("/broadcast")
 @admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Рассылка сообщений пользователям бота."""
