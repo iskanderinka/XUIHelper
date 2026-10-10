@@ -32,8 +32,18 @@ AUDIT_DIR = os.environ.get(
 AUDIT_FILE = os.path.join(AUDIT_DIR, "audit.log")
 AUDIT_MAX_SIZE = 1 * 1024 * 1024  # 1 МБ
 
-# Визуальный разделитель между днями: 5 строк по 76 звёздочек
-DAY_SEPARATOR = "\n" + ("=" * 79 + "\n") * 5 + "\n"
+# Визуальный разделитель между днями (генерируется на лету — дата внутри)
+_SEP_WIDTH = 74
+
+
+def _make_day_separator(date_str: str) -> str:
+    """Создаёт рамку с датой внутри: ╔═══╗ / ║ 📅 YYYY-MM-DD ║ / ╚═══╝."""
+    top = "╔" + "═" * _SEP_WIDTH + "╗"
+    inner_text = f"  📅  {date_str}"
+    padding = max(0, _SEP_WIDTH - len(inner_text))
+    middle = "║" + inner_text + " " * padding + "║"
+    bottom = "╚" + "═" * _SEP_WIDTH + "╝"
+    return f"\n{top}\n{middle}\n{bottom}\n\n"
 
 
 def _rotate_if_needed() -> None:
@@ -120,7 +130,7 @@ def audit_log(
         last_date = _get_last_date_from_file()
         with open(AUDIT_FILE, "a", encoding="utf-8") as f:
             if last_date and last_date != today:
-                f.write(DAY_SEPARATOR)
+                f.write(_make_day_separator(today))
             f.write(line)
     except Exception as e:
         logger.error(f"Не удалось записать в audit.log: {e}")

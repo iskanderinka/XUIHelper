@@ -279,7 +279,7 @@ async def _open_admin_action_list(
     context.user_data["admact_action"] = action
 
     text, keyboard = _render_admin_action_page(bindings, action, 0)
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
 
 
 async def btn_admin_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -467,6 +467,9 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
     old_email = pending["email"]
     chat_id = update.effective_chat.id
 
+    admin_id = update.effective_user.id
+    admin_username = update.effective_user.username or ""
+
     # Удаляем сообщение с вводом, чтобы не мусорить
     try:
         await update.message.delete()
@@ -486,17 +489,26 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
     # Проверка панели
     err = _check_panel_available(panel_name)
     if err:
+        audit_log(action, admin_id, admin_username,
+                  f"FAIL reason=\"панель недоступна\" tg_id={tg_id} email={old_email} panel={panel_name}")
         await context.bot.send_message(chat_id=chat_id, text=err)
         return
 
     if action == "rename":
         err = _validate_email(text)
         if err:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {_esc(err)}\nНачни заново через кнопку «✏️ Переименовать».")
+            audit_log("rename", admin_id, admin_username,
+                      f"FAIL reason=\"email невалиден\" tg_id={tg_id} old={old_email}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ {_esc(err)}\nНачни заново через кнопку «✏️ Переименовать»."
+            )
             return
         new_email = text
 
         if get_binding_by_email(panel_name, new_email):
+            audit_log("rename", admin_id, admin_username,
+                      f"FAIL reason=\"email занят в БД\" old={old_email} new={new_email} panel={panel_name}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ Email <code>{_esc(new_email)}</code> уже занят в БД на '{_esc(panel_name)}'.",
@@ -510,6 +522,8 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 await api.login()
                 existing = await api.get_client_object(new_email)
                 if existing is not None:
+                    audit_log("rename", admin_id, admin_username,
+                              f"FAIL reason=\"email занят в панели\" old={old_email} new={new_email} panel={panel_name}")
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"❌ Клиент с email <code>{_esc(new_email)}</code> уже есть в панели.",
@@ -518,9 +532,11 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     return
                 result = await api.update_client(old_email, new_email=new_email)
         except Exception as e:
-            logger.error(f"[admin={update.effective_user.id}] Ошибка rename '{panel_name}': {e}")
+            logger.error(f"[admin={admin_id}] Ошибка rename '{panel_name}': {e}")
 
         if result is not True:
+            audit_log("rename", admin_id, admin_username,
+                      f"FAIL reason=\"панель отказала\" old={old_email} new={new_email} panel={panel_name}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -534,6 +550,8 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         db_ok = update_binding_email(tg_id, panel_name, old_email, new_email)
         if not db_ok:
+            audit_log("rename", admin_id, admin_username,
+                      f"PARTIAL reason=\"панель ок, БД ошибка\" old={old_email} new={new_email} panel={panel_name}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="⚠️ Панель обновлена, но в БД ошибка. Запусти <code>/sync</code>.",
@@ -542,6 +560,8 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         renamed = rename_traffic_email(panel_name, old_email, new_email)
+        audit_log("rename", admin_id, admin_username,
+                  f"OK tg_id={tg_id} old={old_email} new={new_email} panel={panel_name} traffic_renamed={renamed}")
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -563,9 +583,11 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 await api.login()
                 result = await api.update_client(old_email, comment=new_comment)
         except Exception as e:
-            logger.error(f"[admin={update.effective_user.id}] Ошибка setcomment '{panel_name}/{old_email}': {e}")
+            logger.error(f"[admin={admin_id}] Ошибка setcomment '{panel_name}/{old_email}': {e}")
 
         if result is not True:
+            audit_log("comment", admin_id, admin_username,
+                      f"FAIL reason=\"панель отказала\" tg_id={tg_id} email={old_email} panel={panel_name}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -580,6 +602,9 @@ async def pending_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
             update_binding_comment(tg_id, panel_name, old_email, new_comment)
         except Exception as e:
             logger.error(f"Не удалось обновить комментарий в БД: {e}")
+
+        audit_log("comment", admin_id, admin_username,
+                  f"OK tg_id={tg_id} email={old_email} panel={panel_name}")
 
         shown = f"<code>{_esc(new_comment)}</code>" if new_comment else "<i>(пустой)</i>"
         await context.bot.send_message(
@@ -803,9 +828,13 @@ async def delpanel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Формат: /delpanel <имя панели>")
         return
     panel_name = context.args[0]
+    admin_id = update.effective_user.id
+    admin_username = update.effective_user.username or ""
     if config.delete_panel(panel_name):
+        audit_log("delpanel", admin_id, admin_username, f"OK panel={panel_name}")
         await update.message.reply_text(f"🗑️ Панель '{panel_name}' успешно удалена.")
     else:
+        audit_log("delpanel", admin_id, admin_username, f"FAIL reason=\"панель не найдена\" panel={panel_name}")
         await update.message.reply_text(f"Панель '{panel_name}' не найдена.")
 
 
@@ -1289,6 +1318,8 @@ async def _do_pause(update, context, payload, query) -> None:
     pause_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = ["<b>Ставлю на паузу:</b>\n"]
     any_paused = False
+    ok_count = 0
+    emails_ok = []
 
     for b in bindings:
         panel_name = b["panel_name"]
@@ -1311,6 +1342,8 @@ async def _do_pause(update, context, payload, query) -> None:
             update_binding_enabled(tg_id, panel_name, email, False)
             lines.append(_render_binding_line(panel_name, email, "✅ приостановлена"))
             any_paused = True
+            ok_count += 1
+            emails_ok.append(email)
         elif result is False:
             lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
@@ -1326,6 +1359,21 @@ async def _do_pause(update, context, payload, query) -> None:
             "Täzeden işledeniňde — möhlet awtomatik uzaldylar.\n\n"
             "Administrator bilen habarlaşmak: 🆘 Kömek gerek"
         )
+
+    total = len(bindings)
+    if ok_count == 0:
+        status = "FAIL"
+    elif ok_count == total:
+        status = "OK"
+    else:
+        status = "PARTIAL"
+    emails_str = ",".join(emails_ok) if emails_ok else "-"
+    audit_log(
+        action="pause",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=f"{status} tg_id={tg_id} count={ok_count}/{total} email={emails_str}",
+    )
 
 
 # --- /resumesub ---
@@ -1380,6 +1428,8 @@ async def _do_resume(update, context, payload, query) -> None:
     today_str = now.strftime("%Y-%m-%d")
     lines = ["<b>Снимаю с паузы:</b>\n"]
     resumed = False
+    ok_count = 0
+    emails_ok = []
 
     for b in bindings:
         panel_name = b["panel_name"]
@@ -1394,7 +1444,6 @@ async def _do_resume(update, context, payload, query) -> None:
 
         old_expiry = b.get("expiry_date")
 
-        # Бессрочная подписка: срок не трогаем — пауза на него не влияет
         if old_expiry:
             try:
                 old_dt = datetime.strptime(old_expiry, "%Y-%m-%d")
@@ -1410,7 +1459,6 @@ async def _do_resume(update, context, payload, query) -> None:
             line_extra = f"(+{pause_days} дн., до {new_expiry_str})"
             resumed_status = "✅ возобновлена"
         else:
-            # Бессрочная — срок не меняем
             update_kwargs = {"enable": True}
             new_expiry_str = None
             line_extra = "(бессрочная, срок не изменён)"
@@ -1431,6 +1479,8 @@ async def _do_resume(update, context, payload, query) -> None:
                 update_binding_expiry(tg_id, panel_name, email, new_expiry_str)
             lines.append(_render_binding_line(panel_name, email, resumed_status, line_extra))
             resumed = True
+            ok_count += 1
+            emails_ok.append(email)
         elif result is False:
             lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
@@ -1443,6 +1493,21 @@ async def _do_resume(update, context, payload, query) -> None:
             context, tg_id,
             "▶️ <b>Abuna täzeden işledildi.</b> Möhlet saklanyş günlerine uzaldylar."
         )
+
+    total_paused = sum(1 for b in bindings if b.get("paused_at"))
+    if ok_count == 0:
+        status = "FAIL"
+    elif ok_count == total_paused:
+        status = "OK"
+    else:
+        status = "PARTIAL"
+    emails_str = ",".join(emails_ok) if emails_ok else "-"
+    audit_log(
+        action="resume",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=f"{status} tg_id={tg_id} count={ok_count}/{total_paused} email={emails_str}",
+    )
 
 
 # --- /extendsub ---
@@ -1512,6 +1577,8 @@ async def _do_extend(update, context, payload, query) -> None:
     now = datetime.now()
     lines = ["<b>Продлеваю подписку:</b>\n"]
     last_new_expiry_str = None
+    ok_count = 0
+    emails_ok = []
 
     for b in bindings:
         panel_name = b["panel_name"]
@@ -1555,6 +1622,8 @@ async def _do_extend(update, context, payload, query) -> None:
                 f"до {new_expiry_str}"
             ))
             last_new_expiry_str = new_expiry_str
+            ok_count += 1
+            emails_ok.append(email)
         elif result is False:
             lines.append(_render_binding_line(panel_name, email, "❌ клиента нет в панели"))
         else:
@@ -1571,6 +1640,22 @@ async def _do_extend(update, context, payload, query) -> None:
             )
         except Exception as e:
             logger.warning(f"Не удалось уведомить клиента {tg_id} о продлении: {e}")
+
+    total = len(bindings)
+    if ok_count == 0:
+        status = "FAIL"
+    elif ok_count == total:
+        status = "OK"
+    else:
+        status = "PARTIAL"
+    emails_str = ",".join(emails_ok) if emails_ok else "-"
+    arg = f"+{value}d" if kind == "days" else f"until={value}"
+    audit_log(
+        action="extend",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=f"{status} tg_id={tg_id} {arg} email={emails_str}",
+    )
 
 
 # --- /revoke и /listclients ---
@@ -1621,6 +1706,11 @@ async def _do_revoke(update, context, payload, query) -> None:
     bindings = payload["bindings"]
     lines = ["<b>Удаляю клиентов:</b>\n"]
 
+    # Счётчики для audit
+    ok_panels = 0
+    ok_db = 0
+    emails_deleted = []
+
     for b in bindings:
         panel_name = b["panel_name"]
         email = b["email"]
@@ -1636,13 +1726,37 @@ async def _do_revoke(update, context, payload, query) -> None:
 
         db_ok = delete_binding(tg_id, panel_name, email)
 
+        if panel_ok:
+            ok_panels += 1
+        if db_ok:
+            ok_db += 1
+        if panel_ok or db_ok:
+            emails_deleted.append(email)
+
         mark_panel = "✅" if panel_ok else "❌"
         mark_db = "✅" if db_ok else "❌"
         lines.append(
             f"- <code>{_esc(panel_name)}/{_esc(email)}</code> — "
             f"панель: {mark_panel}, БД: {mark_db}"
         )
+
     await _edit_query_safely(query, "\n".join(lines))
+
+    # Audit-запись
+    total = len(bindings)
+    emails_str = ",".join(_esc(e) for e in emails_deleted) if emails_deleted else "-"
+    if ok_panels == total and ok_db == total:
+        status = "OK"
+    elif ok_panels == 0 and ok_db == 0:
+        status = "FAIL"
+    else:
+        status = "PARTIAL"
+    audit_log(
+        action="revoke",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=f"{status} tg_id={tg_id} email={emails_str}",
+    )
 
 
 async def _do_broadcast(update, context, payload, query) -> None:
@@ -1714,6 +1828,20 @@ async def _do_broadcast(update, context, payload, query) -> None:
         await query.edit_message_text("\n".join(lines), parse_mode='HTML')
     except Exception:
         await query.edit_message_text("\n".join(lines))
+
+    # Audit-запись
+    if failed == 0:
+        status = "OK"
+    elif delivered == 0:
+        status = "FAIL"
+    else:
+        status = "PARTIAL"
+    audit_log(
+        action="broadcast",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=f"{status} recipients={total} delivered={delivered} failed={failed}",
+    )
 
 
 # --- /getlink ---
@@ -1977,8 +2105,13 @@ async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raw_comment = " ".join(context.args[2:]).strip()
     new_comment = "" if raw_comment == "-" else raw_comment
 
+    admin_id = update.effective_user.id
+    admin_username = update.effective_user.username or ""
+
     bindings = _find_bindings_for_admin(tg_id, email)
     if not bindings:
+        audit_log("setcomment", admin_id, admin_username,
+                  f"FAIL reason=\"связка не найдена\" tg_id={tg_id} email={email}")
         await update.message.reply_text(
             f"Связка <code>{_esc(email)}</code> у клиента {tg_id} не найдена.",
             parse_mode='HTML',
@@ -1990,6 +2123,8 @@ async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     err = _check_panel_available(panel_name)
     if err:
+        audit_log("setcomment", admin_id, admin_username,
+                  f"FAIL reason=\"панель недоступна\" tg_id={tg_id} email={email} panel={panel_name}")
         await update.message.reply_text(err)
         return
 
@@ -1999,13 +2134,15 @@ async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await api.login()
             result = await api.update_client(email, comment=new_comment)
     except Exception as e:
-        logger.error(f"[admin={update.effective_user.id}] Ошибка setcomment '{panel_name}/{email}': {e}")
+        logger.error(f"[admin={admin_id}] Ошибка setcomment '{panel_name}/{email}': {e}")
 
     if result is True:
         try:
             update_binding_comment(tg_id, panel_name, email, new_comment)
         except Exception as e:
             logger.error(f"Не удалось обновить комментарий в БД: {e}")
+        audit_log("setcomment", admin_id, admin_username,
+                  f"OK tg_id={tg_id} email={email} panel={panel_name}")
         shown = f"<code>{_esc(new_comment)}</code>" if new_comment else "<i>(пустой)</i>"
         await update.message.reply_text(
             f"✅ Комментарий обновлён.\n\n"
@@ -2015,8 +2152,12 @@ async def setcomment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='HTML',
         )
     elif result is False:
+        audit_log("setcomment", admin_id, admin_username,
+                  f"FAIL reason=\"клиента нет в панели\" tg_id={tg_id} email={email} panel={panel_name}")
         await update.message.reply_text("❌ Клиента нет в панели.")
     else:
+        audit_log("setcomment", admin_id, admin_username,
+                  f"FAIL reason=\"ошибка связи с панелью\" tg_id={tg_id} email={email} panel={panel_name}")
         await update.message.reply_text("❌ Ошибка связи с панелью.")
 
 
@@ -2040,13 +2181,20 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     old_email = context.args[1].strip()
     new_email = context.args[2].strip()
 
+    admin_id = update.effective_user.id
+    admin_username = update.effective_user.username or ""
+
     err = _validate_email(new_email)
     if err:
+        audit_log("rename", admin_id, admin_username,
+                  f"FAIL reason=\"email невалиден\" tg_id={tg_id} old={old_email} new={new_email}")
         await update.message.reply_text(err)
         return
 
     bindings = _find_bindings_for_admin(tg_id, old_email)
     if not bindings:
+        audit_log("rename", admin_id, admin_username,
+                  f"FAIL reason=\"связка не найдена\" tg_id={tg_id} old={old_email}")
         await update.message.reply_text(
             f"Связка <code>{_esc(old_email)}</code> у клиента {tg_id} не найдена.",
             parse_mode='HTML',
@@ -2058,11 +2206,15 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     err = _check_panel_available(panel_name)
     if err:
+        audit_log("rename", admin_id, admin_username,
+                  f"FAIL reason=\"панель недоступна\" tg_id={tg_id} old={old_email} panel={panel_name}")
         await update.message.reply_text(err)
         return
 
     # Проверка в БД
     if get_binding_by_email(panel_name, new_email):
+        audit_log("rename", admin_id, admin_username,
+                  f"FAIL reason=\"email занят в БД\" old={old_email} new={new_email} panel={panel_name}")
         await update.message.reply_text(
             f"❌ Клиент с email <code>{_esc(new_email)}</code> уже существует в БД на '{_esc(panel_name)}'.",
             parse_mode='HTML',
@@ -2076,6 +2228,8 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await api.login()
             existing = await api.get_client_object(new_email)
             if existing is not None:
+                audit_log("rename", admin_id, admin_username,
+                          f"FAIL reason=\"email занят в панели\" old={old_email} new={new_email} panel={panel_name}")
                 await update.message.reply_text(
                     f"❌ Клиент с email <code>{_esc(new_email)}</code> уже есть в панели.",
                     parse_mode='HTML',
@@ -2083,15 +2237,19 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
             result = await api.update_client(old_email, new_email=new_email)
     except Exception as e:
-        logger.error(f"[admin={update.effective_user.id}] Ошибка rename '{panel_name}': {e}")
+        logger.error(f"[admin={admin_id}] Ошибка rename '{panel_name}': {e}")
 
     if result is not True:
         if result is False:
+            audit_log("rename", admin_id, admin_username,
+                      f"FAIL reason=\"клиента нет в панели\" old={old_email} new={new_email} panel={panel_name}")
             await update.message.reply_text(
                 f"❌ Клиента <code>{_esc(old_email)}</code> нет в панели.",
                 parse_mode='HTML',
             )
         else:
+            audit_log("rename", admin_id, admin_username,
+                      f"FAIL reason=\"ошибка связи с панелью\" old={old_email} new={new_email} panel={panel_name}")
             await update.message.reply_text("❌ Ошибка связи с панелью.")
         return
 
@@ -2099,6 +2257,8 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db_ok = update_binding_email(tg_id, panel_name, old_email, new_email)
     if not db_ok:
         logger.error(f"БД: не удалось переименовать {old_email} -> {new_email}")
+        audit_log("rename", admin_id, admin_username,
+                  f"PARTIAL reason=\"панель ок, БД ошибка\" old={old_email} new={new_email} panel={panel_name}")
         await update.message.reply_text(
             "⚠️ Панель обновлена, но в БД ошибка.\nЗапусти <code>/sync</code> для восстановления.",
             parse_mode='HTML',
@@ -2106,6 +2266,9 @@ async def rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     renamed = rename_traffic_email(panel_name, old_email, new_email)
+
+    audit_log("rename", admin_id, admin_username,
+              f"OK tg_id={tg_id} old={old_email} new={new_email} panel={panel_name} traffic_renamed={renamed}")
 
     await update.message.reply_text(
         f"✅ <b>Email изменён</b>\n\n"
@@ -2147,6 +2310,17 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"переименовано {result['total_renamed']}, не найдено в панели {result['total_missing']}"
     )
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+    audit_log(
+        action="sync",
+        tg_id=update.effective_user.id,
+        username=update.effective_user.username or "",
+        details=(
+            f"OK updated={result['total_updated']} "
+            f"renamed={result['total_renamed']} "
+            f"missing={result['total_missing']}"
+        ),
+    )
 
 
 @audit_command("/sync")
@@ -2223,14 +2397,19 @@ async def _do_addclient(update, context, payload, query) -> None:
     expiry_date_str = payload.get("expiry_date_str")
     comment = payload.get("comment") or ""
 
+    admin_id = update.effective_user.id
+    admin_username = update.effective_user.username or ""
+
     client_uuid = str(uuid_module.uuid4())
     sub_id = _make_sub_id()
 
     async with _get_panel_api(panel_name) as api:
         ok = await api.login()
         if not ok:
+            audit_log("addclient", admin_id, admin_username,
+                      f"FAIL reason=\"логин в панель\" email={email} panel={panel_name}")
             await query.edit_message_text("❌ Не удалось подключиться к панели.")
-            logger.error(f"[admin={update.effective_user.id}] Не удалось залогиниться в панель '{panel_name}'")
+            logger.error(f"[admin={admin_id}] Не удалось залогиниться в панель '{panel_name}'")
             return
 
         created = await api.create_client(
@@ -2246,19 +2425,21 @@ async def _do_addclient(update, context, payload, query) -> None:
         sub_link = api.get_client_sub_link(sub_id)
 
     if not created:
+        audit_log("addclient", admin_id, admin_username,
+                  f"FAIL reason=\"панель отказала\" email={email} panel={panel_name}")
         await query.edit_message_text("❌ Не удалось создать клиента. Проверь логи бота.")
-        logger.error(f"[admin={update.effective_user.id}] Не удалось создать клиента '{email}' на '{panel_name}'")
+        logger.error(f"[admin={admin_id}] Не удалось создать клиента '{email}' на '{panel_name}'")
         return
 
-    # Подстраховка: sub_url мог быть снят между шагами диалога
     if not sub_link:
+        audit_log("addclient", admin_id, admin_username,
+                  f"PARTIAL reason=\"sub_url не настроен\" tg_id={tg_id} email={email} panel={panel_name}")
         await query.edit_message_text(
             "⚠️ Клиент создан в панели, но sub_url у панели не настроен.\n"
             "Настрой sub_url через /setting и выдай ссылку клиенту вручную через /getlink."
         )
         return
 
-    # Сохранение в БД
     try:
         save_binding(
             tg_id=tg_id,
@@ -2274,8 +2455,6 @@ async def _do_addclient(update, context, payload, query) -> None:
     except Exception as e:
         logger.error(f"Не удалось сохранить связку: {e}")
 
-    # Уведомление клиенту
-    # Уведомление клиенту
     expiry_line_client = (
         f"Möhlet: <b>{_esc(expiry_date_str)}</b> çenli"
         if expiry_date_str else "Möhlet: <b>möhletsiz</b>"
@@ -2301,7 +2480,6 @@ async def _do_addclient(update, context, payload, query) -> None:
         delivered = False
         logger.error(f"Не удалось отправить клиенту {tg_id}: {e}")
 
-    # Отчёт админу
     comment_line = f"💬 Комментарий: <code>{_esc(comment)}</code>\n" if comment else ""
     expiry_line_admin = f"до {_esc(expiry_date_str)}" if expiry_date_str else "бессрочно"
 
@@ -2321,6 +2499,15 @@ async def _do_addclient(update, context, payload, query) -> None:
         admin_msg += "\n\n⚠️ Не удалось доставить клиенту — возможно, он не запускал бота."
 
     await query.edit_message_text(admin_msg, parse_mode='HTML')
+
+    delivered_str = "delivered=yes" if delivered else "delivered=no"
+    audit_log(
+        action="addclient",
+        tg_id=admin_id,
+        username=admin_username,
+        details=f"OK tg_id={tg_id} email={email} panel={panel_name} inbound={inbound_ids} {delivered_str}",
+    )
+
 
 CLIENTS_PAGE_SIZE = 5
 
